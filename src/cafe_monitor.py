@@ -5,14 +5,18 @@
 #
 # 작성일: 2026-03-09
 # 수정일: 2026-03-10
-# 버전:   v2.0
+# 버전:   v2.1
+#
+# [v2.1 — 2026-03-10]
+#   변경: 최근 1일 이내 게시글만 처리하도록 필터 추가
+#     - 이유: 하루 3번 실행 전환에 맞춰 오래된 글 재처리 방지
+#     - 게시글 날짜를 파싱하여 24시간 초과 게시글 스킵
+#     - 날짜 파싱 실패 시 안전하게 포함 (처리 누락 방지 우선)
 #
 # [v2.0 — 2026-03-10]
-#   Bug Fix: Execution context was destroyed (navigation)
-#     - 원인: page.goto() 후 기존 frame 참조가 무효화됨
-#     - 수정: 모든 frame 참조를 page.goto() 이후에 새로 획득
-#             wait_for_load_state("domcontentloaded") 추가
-#             게시글 이동 시 iframe 재획득 강제화
+#   Bug Fix: Execution context was destroyed
+#     - goto() 후 frame을 항상 새로 획득
+#     - wait_for_load_state("domcontentloaded") 추가
 #
 # [v1.0 — 2026-03-09]
 #   최초 작성
@@ -23,6 +27,7 @@ import asyncio
 import random
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from playwright.async_api import Page
@@ -36,9 +41,10 @@ logger = logging.getLogger(__name__)
 # 상수
 # ──────────────────────────────────────────
 CAFE_URL          = os.environ.get("CAFE_URL", "https://cafe.naver.com/alexstock")
-POSTS_TO_MONITOR  = 15
-PAGE_LOAD_WAIT_S  = 3.0     # v2.0: 2.0 → 3.0
+POSTS_TO_MONITOR  = 30           # 수집 후 날짜 필터링하므로 여유있게 수집
+PAGE_LOAD_WAIT_S  = 3.0
 ACTION_DELAY_S    = 1.5
+POST_MAX_AGE_HOURS = 24          # 24시간 이내 게시글만 처리
 
 
 # ──────────────────────────────────────────
@@ -53,11 +59,12 @@ class CommentInfo:
 
 @dataclass
 class PostInfo:
-    url:      str
-    title:    str
-    author:   str
-    is_new:   bool = False
-    comments: list[CommentInfo] = field(default_factory=list)
+    url:        str
+    title:      str
+    author:     str
+    posted_at:  Optional[datetime] = None   # v2.1: 게시 시각 추가
+    is_new:     bool = False
+    comments:   list[CommentInfo] = field(default_factory=list)
 
 @dataclass
 class MonitorResult:
@@ -68,7 +75,7 @@ class MonitorResult:
 
 
 # ──────────────────────────────────────────
-# iframe 안전 획득 (v2.0 핵심 수정)
+# iframe 안전 획득
 # ──────────────────────────────────────────
 async def _get_fresh_frame(page: Page):
     """
@@ -84,17 +91,67 @@ async def _get_fresh_frame(page: Page):
 
 
 # ──────────────────────────────────────────
-# 게시글 목록 수집
+# 게시글 날짜 파싱 (v2.1 신규)
+# ──────────────────────────────────────────
+def _parse_post_date(date_text: str) -> Optional[datetime]:
+    """
+    네이버 카페 날짜 텍스트 → datetime 변환
+    지원 형식: "2026.03.10.", "03.10. 15:30", "15:30" (오늘)
+    안전장치: 파싱 실패 시 None 반환 → 호출부에서 포함 처리
+    """
+    now = datetime.now(timezone.utc)
+    text = date_text.strip()
+
+    try:
+        # 형식 1: "2026.03.10. 15:30" 또는 "2026.03.10."
+        if text.count('.') >= 3:
+            clean = text.replace(' ', '').rstrip('.')
+            parts = clean.split('.')
+            if len(parts) >= 3:
+                year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+                return datetime(year, month, day, tzinfo=timezone.utc)
+
+        # 형식 2: "03.10. 15:30" (연도 없음 → 올해)
+        if text.count('.') == 2:
+            clean = text.replace(' ', '').rstrip('.')
+            parts = clean.split('.')
+            month, day = int(parts[0]), int(parts[1])
+            return datetime(now.year, month, day, tzinfo=timezone.utc)
+
+        # 형식 3: "15:30" (오늘 시각)
+        if ':' in text and '.' not in text:
+            return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    except (ValueError, IndexError):
+        pass
+
+    return None  # 파싱 실패 → 호출부에서 포함 처리
+
+
+def _is_within_24h(posted_at: Optional[datetime]) -> bool:
+    """
+    24시간 이내 게시글인지 확인
+    안전장치: 날짜 파싱 실패(None) 시 True 반환 (처리 누락 방지 우선)
+    """
+    if posted_at is None:
+        return True  # 파싱 실패 → 안전하게 포함
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=POST_MAX_AGE_HOURS)
+    return posted_at >= cutoff
+
+
+# ──────────────────────────────────────────
+# 게시글 목록 수집 (v2.1: 날짜 파싱 추가)
 # ──────────────────────────────────────────
 async def collect_recent_posts(page: Page) -> list[PostInfo]:
-    """전체글 보기에서 최신 게시글 URL 수집"""
+    """
+    전체글 보기에서 최신 게시글 수집 후 24시간 이내만 반환
+    """
     posts: list[PostInfo] = []
 
     try:
         await page.goto(CAFE_URL, timeout=20000, wait_until="domcontentloaded")
         await asyncio.sleep(PAGE_LOAD_WAIT_S)
 
-        # v2.0: goto 이후 frame 새로 획득
         frame = await _get_fresh_frame(page)
 
         post_links = await frame.locator("a.article").all()
@@ -113,19 +170,42 @@ async def collect_recent_posts(page: Page) -> list[PostInfo]:
                 else:
                     continue
 
+                # 작성자 추출
                 try:
                     author_el = link.locator("xpath=../..//td[@class='td_name']").first
                     author = (await author_el.text_content() or "알수없음").strip()
                 except Exception:
                     author = "알수없음"
 
-                posts.append(PostInfo(url=url, title=title, author=author))
+                # v2.1: 게시 날짜 추출
+                posted_at = None
+                try:
+                    date_el = link.locator("xpath=../..//td[@class='td_date']").first
+                    date_text = await date_el.text_content(timeout=2000) or ""
+                    posted_at = _parse_post_date(date_text)
+                except Exception:
+                    pass  # 날짜 파싱 실패 → None (24시간 필터에서 포함 처리)
+
+                posts.append(PostInfo(
+                    url=url,
+                    title=title,
+                    author=author,
+                    posted_at=posted_at,
+                ))
 
             except Exception as e:
                 logger.debug(f"[monitor] 게시글 링크 파싱 실패: {e}")
                 continue
 
-        logger.info(f"[monitor] 게시글 {len(posts)}개 수집 완료")
+        # ── 24시간 이내 필터링 (v2.1 핵심) ──
+        before_filter = len(posts)
+        posts = [p for p in posts if _is_within_24h(p.posted_at)]
+        skipped = before_filter - len(posts)
+
+        logger.info(
+            f"[monitor] 게시글 수집 완료 | "
+            f"전체:{before_filter} 24h이내:{len(posts)} 스킵:{skipped}"
+        )
 
     except Exception as e:
         logger.error(f"[monitor] 게시글 목록 수집 실패: {e}")
@@ -134,7 +214,7 @@ async def collect_recent_posts(page: Page) -> list[PostInfo]:
 
 
 # ──────────────────────────────────────────
-# 댓글 수집 (v2.0 핵심 수정)
+# 댓글 수집
 # ──────────────────────────────────────────
 async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
     """
@@ -144,11 +224,10 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
     comments: list[CommentInfo] = []
 
     try:
-        # v2.0: domcontentloaded 대기 후 frame 재획득
         await page.goto(post.url, timeout=20000, wait_until="domcontentloaded")
         await asyncio.sleep(PAGE_LOAD_WAIT_S)
 
-        frame = await _get_fresh_frame(page)  # ← 핵심 수정
+        frame = await _get_fresh_frame(page)
 
         comment_items = await frame.locator(".comment_list li.CommentItem").all()
 
@@ -197,7 +276,7 @@ async def delete_spam_comment(
 ) -> bool:
     """스팸 댓글 관리자 삭제"""
     try:
-        frame = await _get_fresh_frame(page)  # v2.0: 매번 새로 획득
+        frame = await _get_fresh_frame(page)
 
         delete_btn = frame.locator(comment.delete_btn_selector).first
         if not await delete_btn.is_visible(timeout=5000):
@@ -207,14 +286,13 @@ async def delete_spam_comment(
         await delete_btn.click()
         await asyncio.sleep(0.8)
 
-        # 확인 팝업 처리
         try:
             page.once("dialog", lambda d: asyncio.create_task(d.accept()))
         except Exception:
             pass
 
         await asyncio.sleep(random.uniform(1.0, 2.0))
-        logger.info(f"[monitor] 스팸 삭제 성공: {comment.author} — '{comment.content[:30]}'")
+        logger.info(f"[monitor] 스팸 삭제: {comment.author} — '{comment.content[:30]}'")
         return True
 
     except Exception as e:
@@ -228,19 +306,19 @@ async def delete_spam_comment(
 async def run_monitor(page: Page) -> MonitorResult:
     """
     전체 모니터링 실행 — main.py에서 호출하는 단일 진입점
+    v2.1: 24시간 이내 게시글만 처리
     """
     result = MonitorResult()
 
     posts = await collect_recent_posts(page)
     if not posts:
-        logger.warning("[monitor] 수집된 게시글 없음")
+        logger.info("[monitor] 처리할 게시글 없음 (24시간 이내 신규 없음)")
         return result
 
     for post in posts:
         result.posts_checked += 1
 
         try:
-            # 댓글 수집 (v2.0: 내부에서 frame 새로 획득)
             comments = await collect_comments(page, post)
             post.comments = comments
 
