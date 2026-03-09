@@ -1,175 +1,181 @@
-"""
-main.py
-네이버 카페 자동 관리 봇 - 메인 실행 파일
-GitHub Actions에서 30분마다 자동 실행
-
-실행 흐름:
-1. 네이버 로그인
-2. 최신 게시글 목록 수집
-3. 각 게시글 댓글 스팸 검사 → 삭제
-4. 신규 게시글 환영 댓글 작성
-5. Supabase에 로그 저장
-"""
+# ============================================================
+# 파일명: main.py
+# 경로:   kangyh427/naver_cafe_bot/src/main.py
+# 역할:   봇 전체 실행 흐름 제어 (오케스트레이터)
+#         GitHub Actions 진입점
+#
+# 작성일: 2026-03-09
+# 버전:   v1.0
+#
+# 실행 순서:
+#   1. 환경변수 검증
+#   2. 네이버 로그인 (naver_login.py)
+#   3. 카페 모니터링 — 스팸 감지/삭제 (cafe_monitor.py)
+#   4. 환영 댓글 작성 (comment_writer.py)
+#   5. 실행 결과 DB 저장 (supabase_logger.py)
+#
+# 안전장치:
+#   - 단계별 독립 예외 처리 (한 단계 실패가 전체 중단 방지)
+#   - 실행 시간 측정 및 로그 저장
+#   - 종료 코드: 0 (성공/부분성공), 1 (로그인 실패 등 치명적 오류)
+#   - 로깅: 콘솔 + GitHub Actions에서 바로 확인 가능한 포맷
+# ============================================================
 
 import asyncio
+import logging
 import sys
-import os
-from dotenv import load_dotenv
+import time
+from typing import Optional
 
-# 로컬 개발 시 .env 로드 (GitHub Actions에서는 Secrets 사용)
-load_dotenv()
+from naver_login import get_logged_in_page
+from cafe_monitor import run_monitor
+from comment_writer import run_comment_writer
+from supabase_logger import log_bot_run
 
-from naver_login import NaverLoginManager
-from cafe_monitor import CafeMonitor
-from spam_detector import SpamDetector
-from comment_writer import CommentWriter
-from supabase_logger import SupabaseLogger
+# ──────────────────────────────────────────
+# 로깅 설정
+# ──────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 
 
-async def main():
-    """메인 봇 실행 함수"""
-    print("=" * 50)
-    print("🤖 알렉스강의 주식이야기 카페 관리봇 시작")
-    print("=" * 50)
+# ──────────────────────────────────────────
+# 환경변수 검증
+# ──────────────────────────────────────────
+REQUIRED_ENV_VARS = [
+    "NAVER_ID",
+    "NAVER_PW",
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_KEY",
+    "GEMINI_API_KEY",
+]
 
-    # 통계 초기화
-    stats = {
-        "posts_checked": 0,
-        "comments_checked": 0,
-        "spam_deleted": 0,
-        "welcome_sent": 0,
-    }
+def validate_env() -> bool:
+    """
+    필수 환경변수 존재 여부 확인
+    Returns: True (모두 존재) / False (누락 있음)
+    """
+    import os
+    missing = [var for var in REQUIRED_ENV_VARS if not os.environ.get(var)]
+    if missing:
+        logger.error(f"[main] 환경변수 누락: {', '.join(missing)}")
+        logger.error("[main] GitHub Secrets에 해당 변수가 등록되어 있는지 확인하세요.")
+        return False
+    logger.info("[main] 환경변수 검증 완료")
+    return True
 
-    # 모듈 초기화
-    login_manager = NaverLoginManager()
-    db_logger = SupabaseLogger()
-    spam_detector = SpamDetector()
+
+# ──────────────────────────────────────────
+# 메인 실행 로직
+# ──────────────────────────────────────────
+async def run_bot() -> int:
+    """
+    봇 전체 실행
+    Returns: 종료 코드 (0: 성공, 1: 치명적 오류)
+    """
+    start_time = time.time()
+    logger.info("=" * 50)
+    logger.info("[main] 네이버 카페봇 시작")
+    logger.info("=" * 50)
+
+    # 1. 환경변수 검증
+    if not validate_env():
+        return 1
+
+    # 실행 통계
+    posts_checked    = 0
+    spam_deleted     = 0
+    welcome_commented = 0
+    error_count      = 0
+    status           = "success"
+    error_message: Optional[str] = None
 
     try:
-        # ── 1. 브라우저 초기화 및 로그인 ──
-        page = await login_manager.init_browser()
-        login_success = await login_manager.login()
+        # 2. 네이버 로그인 + 전체 봇 실행
+        async with get_logged_in_page() as page:
+            logger.info("[main] 네이버 로그인 완료 — 모니터링 시작")
 
-        if not login_success:
-            print("[MAIN] ❌ 로그인 실패 - 봇 종료")
-            await db_logger.log_bot_run(
-                status="error",
-                error_message="네이버 로그인 실패",
-            )
-            return
-
-        await login_manager.verify_cafe_access()
-
-        # ── 2. 모니터/라이터 초기화 ──
-        cafe_monitor = CafeMonitor(page)
-        comment_writer = CommentWriter(page)
-
-        # ── 3. 처리된 게시글 URL 로드 (중복 방지) ──
-        processed_urls = await db_logger.get_processed_urls()
-
-        # ── 4. 최신 게시글 수집 ──
-        posts = await cafe_monitor.get_recent_posts(max_posts=15)
-        stats["posts_checked"] = len(posts)
-        print(f"\n[MAIN] 총 {len(posts)}개 게시글 처리 시작\n")
-
-        # ── 5. 각 게시글 처리 ──
-        for post in posts:
-            post_url = post.get("url", "")
-            post_title = post.get("title", "")
-            post_author = post.get("author", "")
-
-            print(f"\n--- 게시글: {post_title[:40]}... ---")
-
+            # 3. 카페 모니터링 (스팸 감지/삭제)
             try:
-                # 5-1. 해당 게시글의 댓글 수집 및 스팸 검사
-                comments = await cafe_monitor.get_comments_from_post(post_url)
-                stats["comments_checked"] += len(comments)
+                monitor_result = await run_monitor(page)
+                posts_checked  = monitor_result.posts_checked
+                spam_deleted   = monitor_result.spam_deleted
+                error_count   += monitor_result.errors
+                new_post_urls  = monitor_result.new_post_urls
 
-                for comment in comments:
-                    content = comment.get("content", "")
-                    author = comment.get("author", "")
-                    idx = comment.get("index", 0)
-
-                    # 관리자 댓글은 검사 안 함
-                    if author in ["AlexKang", "알렉스", "alexkang"]:
-                        continue
-
-                    # 스팸 판별
-                    should_delete, confidence, reason, keyword = (
-                        await spam_detector.is_spam(content)
-                    )
-
-                    if should_delete:
-                        print(
-                            f"[MAIN] 🗑️ 스팸 삭제: {author} - "
-                            f"'{content[:30]}...' (확신도: {confidence:.0%})"
-                        )
-
-                        # 댓글 삭제
-                        deleted = await cafe_monitor.delete_comment(post_url, idx)
-
-                        if deleted:
-                            stats["spam_deleted"] += 1
-                            await db_logger.log_spam_deleted(
-                                content_type="comment",
-                                author=author,
-                                content=content,
-                                reason=reason,
-                                post_url=post_url,
-                                detected_keyword=keyword,
-                                ai_confidence=confidence,
-                            )
-
-                # 5-2. 신규 게시글 환영 댓글 작성
-                welcome_msg = await comment_writer.process_new_post(
-                    post=post,
-                    processed_urls=processed_urls,
+                logger.info(
+                    f"[main] 모니터링 완료 | "
+                    f"게시글:{posts_checked} 스팸:{spam_deleted} 오류:{monitor_result.errors}"
                 )
-
-                if welcome_msg:
-                    stats["welcome_sent"] += 1
-                    # 처리 완료 표시 (중복 방지)
-                    await db_logger.mark_post_processed(post_url, "welcome")
-                    processed_urls.add(post_url)  # 메모리에도 추가
-
-                    await db_logger.log_welcome_comment(
-                        post_title=post_title,
-                        post_url=post_url,
-                        author=post_author,
-                        welcome_message=welcome_msg,
-                        post_type=post.get("board", "일반"),
-                    )
-
             except Exception as e:
-                print(f"[MAIN] 게시글 처리 오류: {post_title[:30]}... - {e}")
-                continue
+                logger.error(f"[main] 모니터링 단계 오류: {e}")
+                error_count += 1
+                new_post_urls = []
+                status = "partial_error"
 
-        # ── 6. 성공 로그 저장 ──
-        await db_logger.log_bot_run(
-            status="success",
-            **stats,
-        )
+            # 4. 환영 댓글 작성
+            if new_post_urls:
+                try:
+                    welcome_commented = await run_comment_writer(page, new_post_urls)
+                    logger.info(f"[main] 환영 댓글 완료 | 작성:{welcome_commented}개")
+                except Exception as e:
+                    logger.error(f"[main] 환영 댓글 단계 오류: {e}")
+                    error_count += 1
+                    status = "partial_error"
+            else:
+                logger.info("[main] 신규 게시글 없음 — 환영 댓글 스킵")
 
-        print("\n" + "=" * 50)
-        print(f"✅ 봇 실행 완료!")
-        print(f"   - 게시글 확인: {stats['posts_checked']}개")
-        print(f"   - 댓글 확인: {stats['comments_checked']}개")
-        print(f"   - 스팸 삭제: {stats['spam_deleted']}개")
-        print(f"   - 환영 댓글: {stats['welcome_sent']}개")
-        print("=" * 50)
+    except EnvironmentError as e:
+        # 환경변수 오류 — 치명적
+        logger.error(f"[main] 환경변수 오류: {e}")
+        return 1
+
+    except RuntimeError as e:
+        # 로그인 실패 — 치명적
+        logger.error(f"[main] 로그인 실패: {e}")
+        error_message = str(e)
+        status = "failed"
+        error_count += 1
 
     except Exception as e:
-        print(f"\n[MAIN] ❌ 봇 실행 오류: {e}")
-        await db_logger.log_bot_run(
-            status="error",
-            error_message=str(e),
-            **stats,
-        )
-        sys.exit(1)
+        # 예상치 못한 오류
+        logger.error(f"[main] 예기치 않은 오류: {e}", exc_info=True)
+        error_message = str(e)
+        status = "failed"
+        error_count += 1
 
     finally:
-        await login_manager.close()
+        # 5. 실행 결과 DB 저장 (항상 실행)
+        duration = time.time() - start_time
+        log_bot_run(
+            posts_checked=posts_checked,
+            spam_deleted=spam_deleted,
+            welcome_commented=welcome_commented,
+            error_count=error_count,
+            run_duration_sec=duration,
+            status=status,
+            error_message=error_message,
+        )
+
+        logger.info("=" * 50)
+        logger.info(
+            f"[main] 봇 종료 | 상태:{status} | "
+            f"소요:{duration:.1f}초 | "
+            f"게시글:{posts_checked} 스팸:{spam_deleted} 환영:{welcome_commented}"
+        )
+        logger.info("=" * 50)
+
+    return 0 if status != "failed" else 1
 
 
+# ──────────────────────────────────────────
+# 진입점
+# ──────────────────────────────────────────
 if __name__ == "__main__":
-    asyncio.run(main())
+    exit_code = asyncio.run(run_bot())
+    sys.exit(exit_code)
