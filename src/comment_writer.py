@@ -4,33 +4,31 @@
 # 역할:   신규 게시글에 Gemini AI 환영 댓글 자동 작성
 #
 # 작성일: 2026-03-09
-# 버전:   v1.0
+# 수정일: 2026-03-10
+# 버전:   v2.0
 #
-# 의존성:
-#   - google-generativeai (pip install google-generativeai)
-#   - 환경변수: GEMINI_API_KEY
-#   - config/keywords.json (환영 댓글 템플릿 — AI 실패 시 fallback)
-#   - supabase_logger.py (중복 방지 + 로그 저장)
+# [v2.0 — 2026-03-10]
+#   Bug Fix 1: Timeout 5000ms exceeded
+#     - 원인: 댓글 입력창 selector가 실제 네이버 카페 DOM과 불일치
+#     - 수정: selector 우선순위 목록으로 다변화, timeout 15000ms로 증가
+#             실패 시 다음 selector 자동 시도 (fallback chain)
+#   Bug Fix 2: Execution context was destroyed
+#     - 원인: 페이지 이동 후 기존 frame 참조 무효화
+#     - 수정: 모든 액션 직전 frame을 매번 새로 획득
+#   Bug Fix 3: Gemini 429 quota exceeded
+#     - 원인: Free Tier 분당/일당 호출 한도 초과
+#     - 수정: 지수 백오프 재시도 (최대 3회), 재시도 전 대기
+#             실패 시 템플릿 fallback 보장
 #
-# 작동 흐름:
-#   1. processed_posts 확인 → 이미 처리된 글 스킵
-#   2. 게시글 내용 읽기
-#   3. Gemini AI로 맞춤 환영 댓글 생성
-#      └─ AI 실패 시 템플릿 fallback
-#   4. 댓글 입력창에 작성
-#   5. processed_posts 등록 + welcome_logs 저장
-#
-# 안전장치:
-#   - is_post_processed() 로 중복 댓글 방지
-#   - 관리자 본인 게시글 건너뜀
-#   - AI 오류 시 5개 템플릿 중 랜덤 선택 fallback
-#   - 댓글 입력/제출 실패 시 로그만 남기고 계속 진행
+# [v1.0 — 2026-03-09]
+#   최초 작성
 # ============================================================
 
 import asyncio
 import random
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -48,14 +46,20 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────
 # 상수
 # ──────────────────────────────────────────
-BOT_NICKNAME     = "AlexKang"           # 관리자 닉네임 (본인 글 제외용)
-PAGE_LOAD_WAIT_S = 2.0
-COMMENT_MIN_LEN  = 20                   # 환영 댓글 최소 길이
-COMMENT_MAX_LEN  = 150                  # 환영 댓글 최대 길이
+BOT_NICKNAME      = "AlexKang"
+PAGE_LOAD_WAIT_S  = 3.0          # v2.0: 2.0 → 3.0 (iframe 로딩 여유)
+COMMENT_MIN_LEN   = 20
+COMMENT_MAX_LEN   = 150
+SELECTOR_TIMEOUT  = 15000        # v2.0: 5000 → 15000ms
+ACTION_DELAY_S    = random.uniform(3.0, 6.0)
+
+# Gemini 재시도 설정
+GEMINI_MAX_RETRY  = 3
+GEMINI_RETRY_BASE = 30           # 초 (지수 백오프 기준)
 
 
 # ──────────────────────────────────────────
-# 환영 댓글 템플릿 (AI 실패 시 fallback)
+# 환영 댓글 템플릿 (Gemini 실패 시 fallback)
 # ──────────────────────────────────────────
 DEFAULT_TEMPLATES = [
     "안녕하세요! 알렉스강의 주식이야기 카페에 오신 것을 환영합니다 🎉 좋은 정보 나눠주셔서 감사해요!",
@@ -66,13 +70,9 @@ DEFAULT_TEMPLATES = [
 ]
 
 def _load_templates() -> list[str]:
-    """
-    config/keywords.json에서 환영 댓글 템플릿 로드
-    실패 시 기본 템플릿 사용 (봇 중단 방지)
-    """
     try:
-        keywords_path = Path(__file__).parent.parent / "config" / "keywords.json"
-        with open(keywords_path, encoding="utf-8") as f:
+        kw_path = Path(__file__).parent.parent / "config" / "keywords.json"
+        with open(kw_path, encoding="utf-8") as f:
             data = json.load(f)
         templates = data.get("welcome_templates", [])
         if templates:
@@ -85,10 +85,10 @@ WELCOME_TEMPLATES: list[str] = _load_templates()
 
 
 # ──────────────────────────────────────────
-# Gemini AI 환영 댓글 생성
+# Gemini 모델 (지연 초기화)
 # ──────────────────────────────────────────
 def _get_gemini_model():
-    """Gemini 1.5 Flash 모델 반환 (실패 시 None)"""
+    """Gemini 모델 반환 (실패 시 None)"""
     import os
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -100,61 +100,90 @@ def _get_gemini_model():
         return None
 
 
+# ──────────────────────────────────────────
+# Gemini AI 환영 댓글 생성 (지수 백오프 재시도)
+# ──────────────────────────────────────────
 def generate_welcome_comment(post_title: str, post_content: str, author: str) -> str:
     """
-    Gemini AI로 게시글 맞춤 환영 댓글 생성
-    AI 실패 시 템플릿 fallback (항상 댓글 반환 보장)
-
-    Args:
-        post_title:   게시글 제목
-        post_content: 게시글 내용 (앞 300자)
-        author:       게시글 작성자
-    Returns:
-        환영 댓글 문자열 (20~150자)
+    Gemini AI로 맞춤 환영 댓글 생성
+    - 429 오류 발생 시 지수 백오프 후 최대 3회 재시도
+    - 모든 재시도 실패 시 템플릿 fallback (항상 댓글 반환 보장)
     """
     model = _get_gemini_model()
     if not model:
         logger.warning("[writer] Gemini 모델 없음 → 템플릿 fallback")
         return random.choice(WELCOME_TEMPLATES)
 
-    prompt = f"""
-당신은 한국 주식 투자 카페 '알렉스강의 주식이야기'의 관리자입니다.
+    prompt = f"""당신은 한국 주식 투자 카페 '알렉스강의 주식이야기'의 관리자입니다.
 신규 게시글에 따뜻하고 자연스러운 환영 댓글을 작성해 주세요.
 
 게시글 제목: {post_title}
-게시글 내용 (앞부분): {post_content[:300]}
+게시글 내용 (앞부분): {post_content[:200]}
 작성자: {author}
 
 요구사항:
 - 20자 이상 150자 이하
 - 게시글 내용과 자연스럽게 연결
-- 주식/투자 카페 분위기에 맞게 (너무 딱딱하지 않게)
-- 이모지 1~2개 사용 가능
-- 댓글 내용만 작성 (다른 설명 없이)
-"""
+- 주식/투자 카페 분위기 (너무 딱딱하지 않게)
+- 이모지 1~2개
+- 댓글 내용만 작성 (다른 설명 없이)"""
 
+    for attempt in range(1, GEMINI_MAX_RETRY + 1):
+        try:
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.8,
+                    max_output_tokens=200,
+                ),
+            )
+            comment = response.text.strip()
+
+            if COMMENT_MIN_LEN <= len(comment) <= COMMENT_MAX_LEN:
+                return comment
+            elif len(comment) > COMMENT_MAX_LEN:
+                return comment[:COMMENT_MAX_LEN]
+            else:
+                logger.debug(f"[writer] AI 응답 너무 짧음({len(comment)}자) → 템플릿 fallback")
+                return random.choice(WELCOME_TEMPLATES)
+
+        except Exception as e:
+            err_str = str(e)
+            # 429 Rate Limit → 지수 백오프 대기
+            if "429" in err_str or "quota" in err_str.lower():
+                wait_sec = GEMINI_RETRY_BASE * (2 ** (attempt - 1))  # 30s, 60s, 120s
+                logger.warning(
+                    f"[writer] Gemini 429 할당량 초과 "
+                    f"(시도 {attempt}/{GEMINI_MAX_RETRY}) → {wait_sec}초 대기"
+                )
+                if attempt < GEMINI_MAX_RETRY:
+                    time.sleep(wait_sec)
+                    continue
+            else:
+                logger.error(f"[writer] Gemini 호출 실패 (시도 {attempt}): {e}")
+
+            break  # 비-429 오류 또는 최대 재시도 소진
+
+    logger.warning("[writer] Gemini 최대 재시도 소진 → 템플릿 fallback")
+    return random.choice(WELCOME_TEMPLATES)
+
+
+# ──────────────────────────────────────────
+# iframe 안전 획득 헬퍼
+# ──────────────────────────────────────────
+async def _get_fresh_frame(page: Page):
+    """
+    페이지 이동 후 반드시 새 frame 참조 획득
+    안전장치: iframe 없으면 page 직접 반환
+    """
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.8,
-                max_output_tokens=200,
-            ),
-        )
-        comment = response.text.strip()
-
-        # 길이 검증
-        if COMMENT_MIN_LEN <= len(comment) <= COMMENT_MAX_LEN:
-            return comment
-        elif len(comment) > COMMENT_MAX_LEN:
-            return comment[:COMMENT_MAX_LEN]
-        else:
-            logger.debug(f"[writer] AI 응답 너무 짧음({len(comment)}자) → 템플릿 fallback")
-            return random.choice(WELCOME_TEMPLATES)
-
-    except Exception as e:
-        logger.error(f"[writer] Gemini 호출 실패: {e}")
-        return random.choice(WELCOME_TEMPLATES)
+        # 페이지가 완전히 로드될 때까지 대기
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        frame = page.frame_locator("iframe#cafe_main").first
+        return frame
+    except Exception:
+        logger.debug("[writer] iframe 없음 → page 직접 사용")
+        return page
 
 
 # ──────────────────────────────────────────
@@ -166,19 +195,27 @@ async def _read_post_content(page: Page) -> tuple[str, str, str]:
     Returns: (title, content, author)
     """
     try:
-        # iframe 전환
-        try:
-            frame = page.frame_locator("iframe#cafe_main").first
-        except Exception:
-            frame = page
+        frame = await _get_fresh_frame(page)  # v2.0: 매번 새로 획득
 
-        title_el   = frame.locator(".title-text, .tit-box .title").first
-        content_el = frame.locator(".se-main-container, .tbody").first
-        author_el  = frame.locator(".writer-nick-wrap, .cafe-nick-name").first
+        # selector 우선순위 목록으로 다변화
+        title_selectors   = [".title-text", ".tit-box .title", "h3.title", ".ArticleTitle"]
+        content_selectors = [".se-main-container", ".tbody", ".article_body", "#postContent"]
+        author_selectors  = [".writer-nick-wrap", ".cafe-nick-name", ".m-tcol-c", ".nickname"]
 
-        title   = (await title_el.text_content(timeout=5000)  or "").strip()
-        content = (await content_el.text_content(timeout=5000) or "").strip()
-        author  = (await author_el.text_content(timeout=5000)  or "알수없음").strip()
+        async def try_selectors(selectors: list[str]) -> str:
+            for sel in selectors:
+                try:
+                    el = frame.locator(sel).first
+                    text = await el.text_content(timeout=5000)
+                    if text and text.strip():
+                        return text.strip()
+                except Exception:
+                    continue
+            return ""
+
+        title   = await try_selectors(title_selectors)
+        content = await try_selectors(content_selectors)
+        author  = await try_selectors(author_selectors) or "알수없음"
 
         return title, content, author
 
@@ -188,37 +225,78 @@ async def _read_post_content(page: Page) -> tuple[str, str, str]:
 
 
 # ──────────────────────────────────────────
-# 환영 댓글 입력 및 제출
+# 댓글 입력 및 제출 (selector fallback chain)
 # ──────────────────────────────────────────
 async def _submit_comment(page: Page, comment_text: str) -> bool:
     """
-    댓글 입력창에 환영 댓글 작성 및 제출
+    댓글 작성 및 제출
+    v2.0: selector 다변화 + timeout 15초 + frame 매번 새로 획득
     Returns: True (성공) / False (실패)
     """
+    # 댓글 입력창 후보 selectors (우선순위 순)
+    INPUT_SELECTORS = [
+        ".comment-textarea",
+        "textarea[placeholder*='댓글']",
+        "textarea[name='content']",
+        ".CommentBox textarea",
+        "#cmt_write",
+        ".gfg-textarea",
+        "textarea",
+    ]
+
+    # 제출 버튼 후보 selectors
+    SUBMIT_SELECTORS = [
+        ".btn-comment-write",
+        "button.btn_register",
+        ".CommentBox .btn_register",
+        "button[onclick*='comment']",
+        ".comment_write button[type='submit']",
+        ".gfg-btn-write",
+    ]
+
     try:
-        try:
-            frame = page.frame_locator("iframe#cafe_main").first
-        except Exception:
-            frame = page
+        frame = await _get_fresh_frame(page)  # v2.0: 매번 새로 획득
 
-        # 댓글 입력창 클릭
-        comment_input = frame.locator(
-            ".comment-textarea, textarea[name='content'], .CommentBox textarea"
-        ).first
-        await comment_input.click(timeout=5000)
+        # ── 입력창 찾기 (fallback chain) ──
+        input_el = None
+        for sel in INPUT_SELECTORS:
+            try:
+                el = frame.locator(sel).first
+                if await el.is_visible(timeout=SELECTOR_TIMEOUT):
+                    input_el = el
+                    logger.debug(f"[writer] 입력창 selector 성공: {sel}")
+                    break
+            except Exception:
+                continue
+
+        if not input_el:
+            logger.error("[writer] 댓글 입력창을 찾을 수 없음 — selector 전체 실패")
+            return False
+
+        # ── 입력 ──
+        await input_el.click()
         await asyncio.sleep(0.5)
-
-        # 텍스트 입력 (자연스러운 속도)
-        await comment_input.type(comment_text, delay=random.randint(50, 120))
+        await input_el.type(comment_text, delay=random.randint(60, 130))
         await asyncio.sleep(random.uniform(0.8, 1.5))
 
-        # 등록 버튼 클릭
-        submit_btn = frame.locator(
-            ".btn-comment-write, button[type='submit'].comment, .CommentBox .btn_register"
-        ).first
-        await submit_btn.click(timeout=5000)
-        await asyncio.sleep(2.0)
+        # ── 제출 버튼 찾기 (fallback chain) ──
+        submit_el = None
+        for sel in SUBMIT_SELECTORS:
+            try:
+                el = frame.locator(sel).first
+                if await el.is_visible(timeout=5000):
+                    submit_el = el
+                    logger.debug(f"[writer] 제출 버튼 selector 성공: {sel}")
+                    break
+            except Exception:
+                continue
 
+        if not submit_el:
+            logger.error("[writer] 댓글 제출 버튼을 찾을 수 없음")
+            return False
+
+        await submit_el.click()
+        await asyncio.sleep(2.5)
         return True
 
     except Exception as e:
@@ -249,8 +327,8 @@ async def run_comment_writer(page: Page, post_urls: list[str]) -> int:
                 logger.debug(f"[writer] 이미 처리됨, 스킵: {url[:60]}")
                 continue
 
-            # 2. 게시글 진입
-            await page.goto(url, timeout=15000)
+            # 2. 게시글 진입 (v2.0: load state 대기 추가)
+            await page.goto(url, timeout=20000, wait_until="domcontentloaded")
             await asyncio.sleep(PAGE_LOAD_WAIT_S)
 
             # 3. 내용 읽기
@@ -261,15 +339,18 @@ async def run_comment_writer(page: Page, post_urls: list[str]) -> int:
                 logger.debug(f"[writer] 본인 글 스킵: {title[:30]}")
                 continue
 
-            # 5. AI 환영 댓글 생성
-            comment = generate_welcome_comment(title, content, author)
+            # 5. AI 환영 댓글 생성 (동기 함수 — 별도 스레드에서 실행)
+            comment = await asyncio.get_event_loop().run_in_executor(
+                None,
+                generate_welcome_comment,
+                title, content, author
+            )
 
             # 6. 댓글 작성
             submitted = await _submit_comment(page, comment)
 
             if submitted:
                 success_count += 1
-                # 7. DB 등록
                 mark_post_processed(url, author)
                 log_welcome_comment(url, author, comment)
                 logger.info(f"[writer] 환영 댓글 작성 완료: {author} — '{title[:30]}'")
