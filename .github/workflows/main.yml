@@ -24,7 +24,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Playwright Chromium 설치
-        run: playwright install chromium --with-deps
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: 카페봇 실행
         env:
