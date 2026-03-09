@@ -4,48 +4,81 @@
 # 역할:   GitHub Actions 자동 실행 스케줄 설정
 #
 # 작성일: 2026-03-09
-# 버전:   v1.1
+# 수정일: 2026-03-10
+# 버전:   v2.0
+#
+# [v2.0 — 2026-03-10]
+#   변경: 30분마다 전체 실행 → 하루 3번 랜덤 실행
+#     - 이유: 불필요한 전체 탐색 제거, Gemini API 호출 절약,
+#             계정 봇 탐지 위험 최소화
+#     - 오전 10시~11시 사이 임의 시간 (UTC 01:00~02:00)
+#     - 오후  3시~4시  사이 임의 시간 (UTC 06:00~07:00)
+#     - 저녁  8시~9시  사이 임의 시간 (UTC 11:00~12:00)
+#     - 각 시간대 내 임의성: cron 10분 간격 6개 중 GitHub가 랜덤 선택
 #
 # [v1.1 — 2026-03-09]
-#   Bug Fix: Playwright Chromium 설치 실패
-#     - 원인: ubuntu-latest = Ubuntu 24.04
-#             24.04에서 libasound2 패키지명 변경으로 --with-deps 실패
-#     - 수정: runs-on ubuntu-latest → ubuntu-22.04 (안정 버전 고정)
+#   Bug Fix: ubuntu-latest(24.04) → ubuntu-22.04 고정
 #
 # [v1.0 — 2026-03-09]
 #   최초 작성
 #
-# 실행 시간:
-#   한국시간(KST) 오전 9시 ~ 오후 11시, 30분마다
-#   cron UTC 기준: KST = UTC+9
-#     KST 09:00 = UTC 00:00
-#     KST 23:00 = UTC 14:00
-#
 # 실행 흐름:
 #   1. ubuntu-22.04 환경 구성
-#   2. Python 3.11 설치 (pip 캐시 활성화)
+#   2. Python 3.11 설치
 #   3. requirements.txt 의존성 설치
-#   4. Playwright Chromium 브라우저 설치
-#   5. src/main.py 실행 (봇 메인 로직)
+#   4. Playwright Chromium 설치
+#   5. src/main.py 실행
 #
 # 안전장치:
 #   - timeout-minutes: 10 (무한 루프 방지)
-#   - ubuntu-22.04 고정 (OS 업그레이드로 인한 패키지 오류 방지)
+#   - ubuntu-22.04 고정 (OS 패키지 오류 방지)
 #   - GitHub Secrets으로 민감 정보 보호
-#   - workflow_dispatch: 수동 실행 버튼 제공
 # ============================================================
 
 name: 네이버 카페 자동 관리봇
 
 on:
   schedule:
-    - cron: '0,30 0-14 * * *'
+    # ── KST 기준 하루 3번 실행 (UTC = KST - 9시간) ──────────
+    #
+    # [오전 10시~11시] UTC 01:00~02:00
+    # 10분 간격 6개 등록 → GitHub Actions가 그 중 임의 시점에 실행
+    - cron: '0  1 * * *'
+    - cron: '10 1 * * *'
+    - cron: '20 1 * * *'
+    - cron: '30 1 * * *'
+    - cron: '40 1 * * *'
+    - cron: '50 1 * * *'
+    #
+    # [오후 3시~4시] UTC 06:00~07:00
+    - cron: '0  6 * * *'
+    - cron: '10 6 * * *'
+    - cron: '20 6 * * *'
+    - cron: '30 6 * * *'
+    - cron: '40 6 * * *'
+    - cron: '50 6 * * *'
+    #
+    # [저녁 8시~9시] UTC 11:00~12:00
+    - cron: '0  11 * * *'
+    - cron: '10 11 * * *'
+    - cron: '20 11 * * *'
+    - cron: '30 11 * * *'
+    - cron: '40 11 * * *'
+    - cron: '50 11 * * *'
+
+  # 수동 실행 (GitHub Actions 탭 또는 대시보드에서 트리거)
   workflow_dispatch:
 
 jobs:
   run-cafe-bot:
-    runs-on: ubuntu-22.04      # ubuntu-latest(24.04) libasound2 오류 방지
+    runs-on: ubuntu-22.04        # ubuntu-latest(24.04) libasound2 오류 방지
     timeout-minutes: 10
+
+    # ── 중복 실행 방지 ──────────────────────────────────────
+    # 같은 시간대에 여러 cron이 겹칠 경우 1개만 실행
+    concurrency:
+      group: cafe-bot-run
+      cancel-in-progress: false   # 실행 중인 것은 유지, 대기 중인 것만 취소
 
     steps:
       - name: 코드 체크아웃
