@@ -1,122 +1,197 @@
-"""
-supabase_logger.py
-Supabase DB 연동 - 로그 저장 및 처리 기록 관리
-- 스팸 삭제 로그
-- 환영 댓글 로그
-- 처리된 게시글 URL 추적 (중복 방지)
-- 봇 실행 로그
-"""
+# ============================================================
+# 파일명: supabase_logger.py
+# 경로:   kangyh427/naver_cafe_bot/src/supabase_logger.py
+# 역할:   Supabase DB 로그 저장 — 4개 테이블 CRUD 전담
+#
+# 작성일: 2026-03-09
+# 버전:   v1.0
+#
+# 의존성:
+#   - supabase-py (pip install supabase)
+#   - 환경변수: SUPABASE_URL, SUPABASE_SERVICE_KEY
+#
+# 테이블 구조:
+#   spam_logs       — 삭제된 스팸 댓글 기록
+#   welcome_logs    — 작성된 환영 댓글 기록
+#   processed_posts — 처리 완료 게시글 URL (중복 방지)
+#   bot_run_logs    — 봇 실행 이력 및 통계
+#
+# 안전장치:
+#   - 모든 DB 작업 try/except 래핑 — 로거 실패가 메인 로직 중단 금지
+#   - insert 실패 시 False 반환, 예외 미전파
+#   - 환경변수 누락 시 명확한 에러 메시지 출력
+# ============================================================
 
 import os
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
+from typing import Optional
 from supabase import create_client, Client
 
+logger = logging.getLogger(__name__)
 
-class SupabaseLogger:
-    def __init__(self):
+
+# ──────────────────────────────────────────
+# Supabase 클라이언트 싱글톤
+# ──────────────────────────────────────────
+_client: Optional[Client] = None
+
+def get_supabase() -> Client:
+    """Supabase 클라이언트 싱글톤 반환 — 환경변수 누락 시 즉시 예외"""
+    global _client
+    if _client is None:
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_SERVICE_KEY")
-
         if not url or not key:
-            raise ValueError("SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 환경변수 없음")
-
-        self.client: Client = create_client(url, key)
-        print("[DB] Supabase 연결 성공")
-
-    async def get_processed_urls(self) -> set:
-        """처리 완료된 게시글 URL 목록 조회 (중복 방지용)"""
-        try:
-            response = self.client.table("processed_posts").select("post_url").execute()
-            urls = {row["post_url"] for row in response.data}
-            print(f"[DB] 처리된 게시글 {len(urls)}개 로드")
-            return urls
-        except Exception as e:
-            print(f"[DB] URL 조회 오류: {e}")
-            return set()
-
-    async def mark_post_processed(self, post_url: str, post_type: str = "welcome"):
-        """게시글을 처리 완료로 표시"""
-        try:
-            self.client.table("processed_posts").upsert({
-                "post_url": post_url,
-                "post_type": post_type,
-                "processed_at": datetime.utcnow().isoformat(),
-            }).execute()
-        except Exception as e:
-            print(f"[DB] 처리 표시 오류: {e}")
-
-    async def log_spam_deleted(
-        self,
-        content_type: str,     # 'comment' or 'post'
-        author: str,
-        content: str,
-        reason: str,
-        post_url: str,
-        detected_keyword: str = "",
-        ai_confidence: float = 0.0,
-    ):
-        """스팸 삭제 로그 저장"""
-        try:
-            self.client.table("spam_logs").insert({
-                "type": content_type,
-                "author": author,
-                "content": content[:500],   # 최대 500자
-                "reason": reason,
-                "post_url": post_url,
-                "detected_keyword": detected_keyword,
-                "ai_confidence": ai_confidence,
-                "deleted_at": datetime.utcnow().isoformat(),
-            }).execute()
-            print(f"[DB] 스팸 로그 저장: {author} - {content[:30]}...")
-        except Exception as e:
-            print(f"[DB] 스팸 로그 저장 오류: {e}")
-
-    async def log_welcome_comment(
-        self,
-        post_title: str,
-        post_url: str,
-        author: str,
-        welcome_message: str,
-        post_type: str = "일반",
-    ):
-        """환영 댓글 로그 저장"""
-        try:
-            self.client.table("welcome_logs").insert({
-                "post_title": post_title[:200],
-                "post_url": post_url,
-                "author": author,
-                "welcome_message": welcome_message[:500],
-                "post_type": post_type,
-                "commented_at": datetime.utcnow().isoformat(),
-            }).execute()
-            print(f"[DB] 환영 댓글 로그 저장: {author} - {post_title[:30]}...")
-        except Exception as e:
-            print(f"[DB] 환영 댓글 로그 저장 오류: {e}")
-
-    async def log_bot_run(
-        self,
-        status: str,
-        posts_checked: int = 0,
-        comments_checked: int = 0,
-        spam_deleted: int = 0,
-        welcome_sent: int = 0,
-        error_message: str = "",
-    ):
-        """봇 실행 로그 저장"""
-        try:
-            self.client.table("bot_run_logs").insert({
-                "run_at": datetime.utcnow().isoformat(),
-                "status": status,
-                "posts_checked": posts_checked,
-                "comments_checked": comments_checked,
-                "spam_deleted": spam_deleted,
-                "welcome_sent": welcome_sent,
-                "error_message": error_message[:500] if error_message else "",
-            }).execute()
-            print(
-                f"[DB] 실행 로그 저장: {status} | "
-                f"게시글 {posts_checked}개 | 스팸삭제 {spam_deleted}개 | "
-                f"환영댓글 {welcome_sent}개"
+            raise EnvironmentError(
+                "SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 환경변수가 누락되었습니다."
             )
-        except Exception as e:
-            print(f"[DB] 실행 로그 저장 오류: {e}")
+        _client = create_client(url, key)
+    return _client
+
+
+def _now_iso() -> str:
+    """현재 시각 ISO 8601 형식 (UTC)"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ──────────────────────────────────────────
+# 스팸 로그 저장
+# ──────────────────────────────────────────
+def log_spam_deleted(
+    post_url: str,
+    comment_author: str,
+    comment_content: str,
+    spam_reason: str,
+    ai_confidence: Optional[float] = None,
+    keyword_matched: Optional[str] = None,
+) -> bool:
+    """
+    삭제된 스팸 댓글 기록 저장
+    Returns: True (저장 성공) / False (실패)
+    """
+    try:
+        supabase = get_supabase()
+        supabase.table("spam_logs").insert({
+            "post_url":        post_url,
+            "comment_author":  comment_author,
+            "comment_content": comment_content[:1000],  # DB 컬럼 길이 안전장치
+            "spam_reason":     spam_reason,
+            "ai_confidence":   ai_confidence,
+            "keyword_matched": keyword_matched,
+            "deleted_at":      _now_iso(),
+        }).execute()
+        logger.info(f"[logger] 스팸 로그 저장 완료: {comment_author}")
+        return True
+    except Exception as e:
+        logger.error(f"[logger] 스팸 로그 저장 실패: {e}")
+        return False
+
+
+# ──────────────────────────────────────────
+# 환영 댓글 로그 저장
+# ──────────────────────────────────────────
+def log_welcome_comment(
+    post_url: str,
+    post_author: str,
+    comment_content: str,
+) -> bool:
+    """
+    작성된 환영 댓글 기록 저장
+    Returns: True (저장 성공) / False (실패)
+    """
+    try:
+        supabase = get_supabase()
+        supabase.table("welcome_logs").insert({
+            "post_url":        post_url,
+            "post_author":     post_author,
+            "comment_content": comment_content[:1000],
+            "commented_at":    _now_iso(),
+        }).execute()
+        logger.info(f"[logger] 환영 댓글 로그 저장 완료: {post_author}")
+        return True
+    except Exception as e:
+        logger.error(f"[logger] 환영 댓글 로그 저장 실패: {e}")
+        return False
+
+
+# ──────────────────────────────────────────
+# 처리된 게시글 URL 관리 (중복 방지)
+# ──────────────────────────────────────────
+def is_post_processed(post_url: str) -> bool:
+    """
+    이미 환영 댓글을 단 게시글인지 확인
+    Returns: True (이미 처리됨) / False (미처리 또는 조회 실패)
+    안전장치: DB 조회 실패 시 False 반환 → 중복보다 누락 방지 우선
+    """
+    try:
+        supabase = get_supabase()
+        result = (
+            supabase.table("processed_posts")
+            .select("id")
+            .eq("post_url", post_url)
+            .limit(1)
+            .execute()
+        )
+        return len(result.data) > 0
+    except Exception as e:
+        logger.error(f"[logger] processed_posts 조회 실패: {e}")
+        return False  # 실패 시 안전하게 미처리로 간주
+
+
+def mark_post_processed(post_url: str, post_author: str) -> bool:
+    """
+    처리 완료 게시글 URL 등록
+    Returns: True (등록 성공) / False (실패)
+    """
+    try:
+        supabase = get_supabase()
+        supabase.table("processed_posts").insert({
+            "post_url":    post_url,
+            "post_author": post_author,
+            "processed_at": _now_iso(),
+        }).execute()
+        return True
+    except Exception as e:
+        logger.error(f"[logger] processed_posts 등록 실패: {e}")
+        return False
+
+
+# ──────────────────────────────────────────
+# 봇 실행 이력 저장
+# ──────────────────────────────────────────
+def log_bot_run(
+    posts_checked: int,
+    spam_deleted: int,
+    welcome_commented: int,
+    error_count: int,
+    run_duration_sec: float,
+    status: str = "success",
+    error_message: Optional[str] = None,
+) -> bool:
+    """
+    봇 1회 실행 결과 통계 저장
+    status: "success" | "partial_error" | "failed"
+    Returns: True (저장 성공) / False (실패)
+    """
+    try:
+        supabase = get_supabase()
+        supabase.table("bot_run_logs").insert({
+            "posts_checked":     posts_checked,
+            "spam_deleted":      spam_deleted,
+            "welcome_commented": welcome_commented,
+            "error_count":       error_count,
+            "run_duration_sec":  round(run_duration_sec, 2),
+            "status":            status,
+            "error_message":     error_message,
+            "run_at":            _now_iso(),
+        }).execute()
+        logger.info(
+            f"[logger] 실행 로그 저장 완료 | "
+            f"게시글:{posts_checked} 스팸:{spam_deleted} 환영:{welcome_commented} "
+            f"오류:{error_count} ({run_duration_sec:.1f}초)"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[logger] 봇 실행 로그 저장 실패: {e}")
+        return False
