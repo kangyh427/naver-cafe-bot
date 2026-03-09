@@ -1,7 +1,14 @@
 # ============================================================
-# requirements.txt
-# 경로: kangyh427/naver_cafe_bot/requirements.txt
-# 버전: 2026-03-09
+# 파일명: requirements.txt
+# 경로:   kangyh427/naver_cafe_bot/requirements.txt
+#
+# 작성일: 2026-03-09
+# 버전:   v1.1
+#
+# [v1.1 — 2026-03-09]
+#   Bug Fix: ModuleNotFoundError: No module named 'dotenv'
+#     - 원인: python-dotenv 누락
+#     - 수정: python-dotenv 추가
 # ============================================================
 
 # 브라우저 자동화
@@ -12,3 +19,6 @@ google-generativeai==0.8.3
 
 # Supabase DB 연동
 supabase==2.4.1
+
+# 환경변수 로드 (.env 파일 지원)
+python-dotenv==1.0.1
