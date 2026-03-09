@@ -87,7 +87,7 @@ def _get_gemini_model():
         return None
     try:
         genai.configure(api_key=api_key)
-        return genai.GenerativeModel("gemini-1.5-flash")
+        return genai.GenerativeModel("gemini-2.0-flash")
     except Exception as e:
         logger.error(f"[spam] Gemini 초기화 실패: {e}")
         return None
