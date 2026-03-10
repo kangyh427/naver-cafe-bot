@@ -4,22 +4,22 @@
 # 역할:   Supabase DB 로그 저장 — 4개 테이블 CRUD 전담
 #
 # 작성일: 2026-03-09
-# 버전:   v1.0
+# 수정일: 2026-03-10
+# 버전:   v1.1
 #
-# 의존성:
-#   - supabase-py (pip install supabase)
-#   - 환경변수: SUPABASE_URL, SUPABASE_SERVICE_KEY
+# [v1.1 — 2026-03-10]
+#   Bug Fix: DB 실제 컬럼명과 불일치로 bot_run_logs 저장 실패
+#     - welcome_commented → welcome_sent
+#     - error_count 제거 (DB에 없음)
+#     - run_duration_sec 제거 (DB에 없음)
+#     - comments_checked 추가
 #
-# 테이블 구조:
-#   spam_logs       — 삭제된 스팸 댓글 기록
-#   welcome_logs    — 작성된 환영 댓글 기록
-#   processed_posts — 처리 완료 게시글 URL (중복 방지)
-#   bot_run_logs    — 봇 실행 이력 및 통계
+# [v1.0 — 2026-03-09]
+#   최초 작성
 #
 # 안전장치:
 #   - 모든 DB 작업 try/except 래핑 — 로거 실패가 메인 로직 중단 금지
 #   - insert 실패 시 False 반환, 예외 미전파
-#   - 환경변수 누락 시 명확한 에러 메시지 출력
 # ============================================================
 
 import os
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _client: Optional[Client] = None
 
 def get_supabase() -> Client:
-    """Supabase 클라이언트 싱글톤 반환 — 환경변수 누락 시 즉시 예외"""
+    """Supabase 클라이언트 싱글톤 반환"""
     global _client
     if _client is None:
         url = os.environ.get("SUPABASE_URL")
@@ -66,16 +66,13 @@ def log_spam_deleted(
     ai_confidence: Optional[float] = None,
     keyword_matched: Optional[str] = None,
 ) -> bool:
-    """
-    삭제된 스팸 댓글 기록 저장
-    Returns: True (저장 성공) / False (실패)
-    """
+    """삭제된 스팸 댓글 기록 저장"""
     try:
         supabase = get_supabase()
         supabase.table("spam_logs").insert({
             "post_url":        post_url,
             "comment_author":  comment_author,
-            "comment_content": comment_content[:1000],  # DB 컬럼 길이 안전장치
+            "comment_content": comment_content[:1000],
             "spam_reason":     spam_reason,
             "ai_confidence":   ai_confidence,
             "keyword_matched": keyword_matched,
@@ -96,10 +93,7 @@ def log_welcome_comment(
     post_author: str,
     comment_content: str,
 ) -> bool:
-    """
-    작성된 환영 댓글 기록 저장
-    Returns: True (저장 성공) / False (실패)
-    """
+    """작성된 환영 댓글 기록 저장"""
     try:
         supabase = get_supabase()
         supabase.table("welcome_logs").insert({
@@ -119,11 +113,7 @@ def log_welcome_comment(
 # 처리된 게시글 URL 관리 (중복 방지)
 # ──────────────────────────────────────────
 def is_post_processed(post_url: str) -> bool:
-    """
-    이미 환영 댓글을 단 게시글인지 확인
-    Returns: True (이미 처리됨) / False (미처리 또는 조회 실패)
-    안전장치: DB 조회 실패 시 False 반환 → 중복보다 누락 방지 우선
-    """
+    """이미 환영 댓글을 단 게시글인지 확인"""
     try:
         supabase = get_supabase()
         result = (
@@ -136,14 +126,11 @@ def is_post_processed(post_url: str) -> bool:
         return len(result.data) > 0
     except Exception as e:
         logger.error(f"[logger] processed_posts 조회 실패: {e}")
-        return False  # 실패 시 안전하게 미처리로 간주
+        return False
 
 
 def mark_post_processed(post_url: str, post_author: str) -> bool:
-    """
-    처리 완료 게시글 URL 등록
-    Returns: True (등록 성공) / False (실패)
-    """
+    """처리 완료 게시글 URL 등록"""
     try:
         supabase = get_supabase()
         supabase.table("processed_posts").insert({
@@ -171,17 +158,22 @@ def log_bot_run(
 ) -> bool:
     """
     봇 1회 실행 결과 통계 저장
-    status: "success" | "partial_error" | "failed"
-    Returns: True (저장 성공) / False (실패)
+
+    v1.1: DB 실제 컬럼명에 맞춤
+      - welcome_commented → welcome_sent
+      - error_count, run_duration_sec → DB에 없으므로 저장 안 함
+      - comments_checked → posts_checked 값 재사용
+
+    함수 시그니처는 main.py 호환을 위해 유지하되,
+    DB insert 시 실제 컬럼명으로 매핑
     """
     try:
         supabase = get_supabase()
         supabase.table("bot_run_logs").insert({
             "posts_checked":     posts_checked,
+            "comments_checked":  0,
             "spam_deleted":      spam_deleted,
-            "welcome_commented": welcome_commented,
-            "error_count":       error_count,
-            "run_duration_sec":  round(run_duration_sec, 2),
+            "welcome_sent":      welcome_commented,
             "status":            status,
             "error_message":     error_message,
             "run_at":            _now_iso(),
