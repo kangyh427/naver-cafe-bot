@@ -19,26 +19,22 @@ import { fetchTodayStats, fetchRecentRunLogs, fetchRecentSpamLogs, fetchRecentWe
 import type { TodayStats, BotRunLog, SpamLog, WelcomeLog } from "@/lib/types";
 
 const DEFAULT_STATS: TodayStats = { runCount: 0, spamDeleted: 0, welcomeSent: 0, postsChecked: 0 };
-const PAGE_SIZE    = 10;   // 모든 섹션 공통 — 페이지당 10건
-const INITIAL_FETCH = 500; // 충분히 로드 (전체 페이지네이션은 클라이언트에서 처리)
+const PAGE_SIZE     = 10;
+const INITIAL_FETCH = 500;
 
 export default function DashboardPage() {
-  // ── 데이터 상태 ───────────────────────────────────────────
   const [stats,       setStats]       = useState<TodayStats>(DEFAULT_STATS);
   const [runLogs,     setRunLogs]     = useState<BotRunLog[]>([]);
   const [spamLogs,    setSpamLogs]    = useState<SpamLog[]>([]);
   const [welcomeLogs, setWelcomeLogs] = useState<WelcomeLog[]>([]);
   const [isLoading,   setIsLoading]   = useState(true);
-
-  // ── 페이지 상태 (섹션별 독립) ─────────────────────────────
   const [runPage,     setRunPage]     = useState(1);
   const [spamPage,    setSpamPage]    = useState(1);
   const [welcomePage, setWelcomePage] = useState(1);
 
-  // ── 데이터 로드 ───────────────────────────────────────────
   const loadAll = useCallback(async () => {
     setIsLoading(true);
-    setRunPage(1); setSpamPage(1); setWelcomePage(1); // 새로고침 시 1페이지로 초기화
+    setRunPage(1); setSpamPage(1); setWelcomePage(1);
     try {
       const [todayStats, runs, spams, welcomes] = await Promise.all([
         fetchTodayStats(),
@@ -59,7 +55,7 @@ export default function DashboardPage() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
-  // ── 페이지네이션 계산 ─────────────────────────────────────
+  // 전체 페이지 수 계산
   const runTotalPages     = Math.max(1, Math.ceil(runLogs.length / PAGE_SIZE));
   const spamTotalPages    = Math.max(1, Math.ceil(spamLogs.length / PAGE_SIZE));
   const welcomeTotalPages = Math.max(1, Math.ceil(welcomeLogs.length / PAGE_SIZE));
@@ -75,10 +71,8 @@ export default function DashboardPage() {
     <div className="min-h-screen bg-[#0D1117]">
       <Header lastRunAt={lastRun?.run_at ?? null} isRefreshing={isLoading} onRefresh={loadAll} />
       <main className="max-w-5xl mx-auto px-4 py-5 space-y-4">
-
         <StatCards stats={stats} isLoading={isLoading} />
         <BotToggle lastRun={lastRun} onTriggered={loadAll} />
-
         <RunTimeline
           logs={pagedRunLogs}
           isLoading={isLoading}
@@ -86,7 +80,6 @@ export default function DashboardPage() {
           totalPages={runTotalPages}
           onPageChange={setRunPage}
         />
-
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <SpamList
             logs={pagedSpamLogs}
@@ -103,7 +96,6 @@ export default function DashboardPage() {
             onPageChange={setWelcomePage}
           />
         </div>
-
         <p className="text-center text-xs text-[#484F58] pb-4">
           알렉스강의 주식이야기 카페봇 대시보드
         </p>
