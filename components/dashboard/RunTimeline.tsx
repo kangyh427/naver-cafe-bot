@@ -68,9 +68,7 @@ export default function RunTimeline({
             {logs.map((log, idx) => {
               const { variant, label } = getStatusConfig(log.status);
               const runTime  = format(new Date(log.run_at), "MM/dd HH:mm", { locale: ko });
-              const duration = log.run_duration_sec
-                ? `${log.run_duration_sec.toFixed(0)}초`
-                : "-";
+              const duration = "-";
 
               return (
                 <div
@@ -109,10 +107,7 @@ export default function RunTimeline({
                     </span>
                     <span className="text-xs text-[#3FB950]">
                       환영 <span className="font-stat">{log.welcome_commented}</span>
-                    </span>
-                    <span className="text-xs text-[#484F58] hidden sm:block font-stat">
-                      {duration}
-                    </span>
+                    </span>                    
                   </div>
                 </div>
               );
