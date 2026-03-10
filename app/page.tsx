@@ -30,7 +30,7 @@ import type { TodayStats, BotRunLog, SpamLog, WelcomeLog } from "@/lib/types";
 
 // ── 초기 빈 상태 ─────────────────────────────────────────────
 const DEFAULT_STATS: TodayStats = {
-  runCount: 0, spamDeleted: 0, welcomeCommented: 0, postsChecked: 0,
+  runCount: 0, spamDeleted: 0, welcomeSent: 0, postsChecked: 0,
 };
 
 // ── 페이지당 표시 건수 ────────────────────────────────────────
