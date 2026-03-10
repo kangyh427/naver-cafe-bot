@@ -334,12 +334,21 @@ async def run_comment_writer(page: Page, post_urls: list[str]) -> int:
             # 3. 내용 읽기
             title, content, author = await _read_post_content(page)
 
-            # 4. 관리자 본인 글 스킵
+             # 4. 관리자 본인 글 스킵
             if author == BOT_NICKNAME:
                 logger.debug(f"[writer] 본인 글 스킵: {title[:30]}")
                 continue
 
-            # 5. AI 환영 댓글 생성 (동기 함수 — 별도 스레드에서 실행)
+            # 4-1. 의심 닉네임 작성자 환영 댓글 스킵 (v2.1)
+            from spam_detector import check_suspicious_nickname
+            matched = check_suspicious_nickname(author)
+            if matched:
+                logger.warning(f"[writer] 의심 닉네임 스킵: '{author}' (패턴: '{matched}')")
+                mark_post_processed(url, author)
+                continue
+
+            # 5. AI 환영 댓글 생성
+
             comment = await asyncio.get_event_loop().run_in_executor(
                 None,
                 generate_welcome_comment,
