@@ -1,21 +1,25 @@
 # ============================================================
 # 파일명: spam_detector.py
 # 경로:   kangyh427/naver_cafe_bot/src/spam_detector.py
-# 역할:   스팸 댓글 2단계 판별 엔진
-#         1차: 키워드 필터 (빠른 차단)
-#         2차: Gemini AI 판별 (정밀 분석)
+# 역할:   스팸 댓글 판별 엔진
+#         1차: 의심 닉네임 필터 (즉시 삭제)
+#         2차: 키워드 필터 (빠른 차단)
+#         3차: Gemini AI 판별 (정밀 분석)
 #
 # 작성일: 2026-03-09
 # 수정일: 2026-03-10
-# 버전:   v2.0
+# 버전:   v2.1
+#
+# [v2.1 — 2026-03-10]
+#   기능 추가: 의심 닉네임 필터
+#     - "알렉스강", "매니져", "매니저", "스텝" 등 관리자 사칭 닉네임 감지
+#     - keywords.json → suspicious_nicknames 목록에서 로드
+#     - 닉네임 매칭 시 AI 판별 없이 즉시 스팸 처리
+#     - is_spam() 함수에 comment_author 파라미터 추가
 #
 # [v2.0 — 2026-03-10]
 #   Bug Fix: Gemini 429 quota exceeded
-#     - 원인: Free Tier 분당/일당 호출 한도 초과
-#     - 수정1: 지수 백오프 재시도 (최대 2회, 30s/60s 대기)
-#     - 수정2: 모듈 레벨 호출 카운터 — 분당 12회 초과 시 AI 생략
-#              (Free Tier 한도 15회/분에서 여유 3회 보존)
-#     - 수정3: 429 발생 시 즉시 False 반환 (삭제 안 함 원칙 유지)
+#     - 지수 백오프 재시도, 분당 12회 자체 속도 제한 가드
 #
 # [v1.0 — 2026-03-09]
 #   최초 작성
@@ -40,21 +44,16 @@ SPAM_MEDIUM_CONFIDENCE = 0.70
 
 # ──────────────────────────────────────────
 # Gemini 호출 속도 제한 가드
-# (Free Tier: 15 req/min → 분당 12회로 자체 제한)
 # ──────────────────────────────────────────
-_call_timestamps: list[float] = []   # 최근 호출 시각 기록
-RATE_LIMIT_PER_MIN = 12              # 자체 제한 (Free Tier 15 중 여유 3 확보)
-GEMINI_MAX_RETRY   = 2               # 429 재시도 횟수
-GEMINI_RETRY_BASE  = 30              # 지수 백오프 기준 초
+_call_timestamps: list[float] = []
+RATE_LIMIT_PER_MIN = 12
+GEMINI_MAX_RETRY   = 2
+GEMINI_RETRY_BASE  = 30
 
 
 def _check_rate_limit() -> bool:
-    """
-    분당 호출 횟수 확인
-    Returns: True (호출 가능) / False (한도 초과, 대기 필요)
-    """
+    """분당 호출 횟수 확인"""
     now = time.time()
-    # 1분 이내 호출만 유지
     recent = [t for t in _call_timestamps if now - t < 60]
     _call_timestamps.clear()
     _call_timestamps.extend(recent)
@@ -64,10 +63,9 @@ def _check_rate_limit() -> bool:
         wait_sec = 60 - (now - oldest) + 1
         logger.warning(
             f"[spam] Gemini 분당 한도 도달 ({len(recent)}/{RATE_LIMIT_PER_MIN}) "
-            f"→ {wait_sec:.0f}초 대기 후 재시도"
+            f"→ {wait_sec:.0f}초 대기"
         )
         time.sleep(wait_sec)
-        # 대기 후 재확인
         now2 = time.time()
         recent2 = [t for t in _call_timestamps if now2 - t < 60]
         return len(recent2) < RATE_LIMIT_PER_MIN
@@ -76,24 +74,30 @@ def _check_rate_limit() -> bool:
 
 
 # ──────────────────────────────────────────
-# 키워드 로드
+# 키워드 + 의심 닉네임 로드
 # ──────────────────────────────────────────
-def _load_spam_keywords() -> list[str]:
+def _load_keywords_config() -> dict:
+    """keywords.json에서 스팸 키워드 + 의심 닉네임 로드"""
     try:
         kw_path = Path(__file__).parent.parent / "config" / "keywords.json"
         with open(kw_path, encoding="utf-8") as f:
             data = json.load(f)
-        keywords = data.get("spam_keywords", [])
-        logger.info(f"[spam] 키워드 {len(keywords)}개 로드 완료")
-        return keywords
+        return data
     except FileNotFoundError:
-        logger.warning("[spam] keywords.json 없음 — 키워드 필터 비활성화")
-        return []
+        logger.warning("[spam] keywords.json 없음 — 필터 비활성화")
+        return {}
     except Exception as e:
         logger.error(f"[spam] keywords.json 로드 실패: {e}")
-        return []
+        return {}
 
-SPAM_KEYWORDS: list[str] = _load_spam_keywords()
+_config = _load_keywords_config()
+SPAM_KEYWORDS: list[str] = _config.get("spam_keywords", [])
+SUSPICIOUS_NICKNAMES: list[str] = _config.get("suspicious_nicknames", [])
+
+logger.info(
+    f"[spam] 키워드 {len(SPAM_KEYWORDS)}개, "
+    f"의심 닉네임 {len(SUSPICIOUS_NICKNAMES)}개 로드 완료"
+)
 
 
 # ──────────────────────────────────────────
@@ -113,13 +117,28 @@ def _get_gemini_model():
 
 
 # ──────────────────────────────────────────
+# 0단계: 의심 닉네임 필터 (v2.1 신규)
+# ──────────────────────────────────────────
+def check_suspicious_nickname(author: str) -> Optional[str]:
+    """
+    관리자/스텝 사칭 닉네임 감지
+    부분 일치(contains) 방식으로 검사
+    Returns: 매칭된 닉네임 패턴 / None
+    """
+    if not author:
+        return None
+    author_lower = author.lower().strip()
+    for nickname in SUSPICIOUS_NICKNAMES:
+        if nickname.lower() in author_lower:
+            return nickname
+    return None
+
+
+# ──────────────────────────────────────────
 # 1단계: 키워드 필터
 # ──────────────────────────────────────────
 def check_keyword_spam(text: str) -> Optional[str]:
-    """
-    1차 키워드 필터
-    Returns: 매칭된 키워드 / None
-    """
+    """1차 키워드 필터 — Returns: 매칭된 키워드 / None"""
     text_lower = text.lower()
     for keyword in SPAM_KEYWORDS:
         if keyword.lower() in text_lower:
@@ -128,10 +147,10 @@ def check_keyword_spam(text: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────
-# 2단계: Gemini AI 판별 (지수 백오프 재시도)
+# 2단계: Gemini AI 판별
 # ──────────────────────────────────────────
 def _parse_ai_response(response_text: str) -> tuple[bool, float]:
-    """AI 응답 파싱 — JSON 우선, 실패 시 텍스트 fallback"""
+    """AI 응답 파싱"""
     try:
         cleaned = re.sub(r"```(?:json)?", "", response_text).strip()
         data = json.loads(cleaned)
@@ -146,18 +165,11 @@ def _parse_ai_response(response_text: str) -> tuple[bool, float]:
 
 
 def check_ai_spam(comment_text: str, post_context: str = "") -> tuple[bool, float]:
-    """
-    2차 Gemini AI 스팸 판별
-    - 분당 호출 한도 초과 시 자동 대기
-    - 429 발생 시 지수 백오프 재시도 (최대 2회)
-    Returns: (is_spam: bool, confidence: float)
-    안전장치: 오류 시 (False, 0.0) — 삭제 안 함 원칙
-    """
+    """2차 Gemini AI 스팸 판별"""
     model = _get_gemini_model()
     if not model:
         return False, 0.0
 
-    # 분당 속도 제한 확인
     if not _check_rate_limit():
         logger.warning("[spam] 속도 제한 대기 후에도 한도 초과 → 정상으로 처리")
         return False, 0.0
@@ -175,7 +187,6 @@ JSON만 반환 (다른 텍스트 없이):
 
     for attempt in range(1, GEMINI_MAX_RETRY + 1):
         try:
-            # 호출 시각 기록
             _call_timestamps.append(time.time())
 
             response = model.generate_content(
@@ -215,13 +226,28 @@ JSON만 반환 (다른 텍스트 없이):
 def is_spam(
     comment_text: str,
     post_context: str = "",
+    comment_author: str = "",
 ) -> tuple[bool, str]:
     """
     스팸 여부 최종 판별 — 외부에서 호출하는 단일 진입점
+
+    v2.1: comment_author 파라미터 추가
+      - 의심 닉네임 감지 시 AI 판별 없이 즉시 스팸 처리
+
     Returns: (is_spam: bool, reason: str)
     """
     if not comment_text or not comment_text.strip():
         return False, "빈 댓글"
+
+    # 0단계: 의심 닉네임 필터 (AI 없이 즉시 삭제)
+    if comment_author:
+        matched_nickname = check_suspicious_nickname(comment_author)
+        if matched_nickname:
+            logger.warning(
+                f"[spam] 의심 닉네임 감지: '{comment_author}' "
+                f"(패턴: '{matched_nickname}') → 즉시 삭제"
+            )
+            return True, f"의심 닉네임 '{matched_nickname}' 감지 — 관리자 사칭 의심"
 
     # 1단계: 키워드 필터
     matched_keyword = check_keyword_spam(comment_text)
