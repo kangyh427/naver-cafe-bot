@@ -1,14 +1,20 @@
 // ============================================================
 // 파일명: supabase.ts
-// 경로:   cafe-bot-dashboard/lib/supabase.ts
+// 경로:   naver-cafe-bot/lib/supabase.ts
 // 역할:   Supabase 클라이언트 싱글톤 + 데이터 조회 함수 전담
 //
-// 설계 원칙:
-//   - 클라이언트는 싱글톤으로 한 번만 생성 (성능 최적화)
-//   - 모든 DB 조회 함수는 이 파일에서만 관리 (단일 책임)
-//   - 조회 실패 시 빈 배열/기본값 반환 (UI 크래시 방지)
-//
 // 작성일: 2026-03-10
+// 수정일: 2026-03-10
+// 버전:   v1.1
+//
+// [v1.1 — 2026-03-10]
+//   Bug Fix: DB 실제 컬럼명과 불일치 수정
+//     - welcome_commented → welcome_sent
+//     - run_duration_sec 제거
+//     - comments_checked 반영
+//
+// [v1.0 — 2026-03-10]
+//   최초 작성
 // ============================================================
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -34,15 +40,11 @@ export function getSupabaseClient(): SupabaseClient {
 }
 
 // ── 오늘 통계 집계 ───────────────────────────────────────────
-/**
- * 오늘(KST) bot_run_logs에서 통계 합산
- * 안전장치: 오류 시 모든 값 0 반환
- */
 export async function fetchTodayStats(): Promise<TodayStats> {
   const defaultStats: TodayStats = {
     runCount: 0,
     spamDeleted: 0,
-    welcomeCommented: 0,
+    welcomeSent: 0,
     postsChecked: 0,
   };
 
@@ -58,7 +60,7 @@ export async function fetchTodayStats(): Promise<TodayStats> {
 
     const { data, error } = await supabase
       .from("bot_run_logs")
-      .select("posts_checked, spam_deleted, welcome_commented")
+      .select("posts_checked, spam_deleted, welcome_sent")
       .gte("run_at", todayKST.toISOString());
 
     if (error) throw error;
@@ -66,10 +68,10 @@ export async function fetchTodayStats(): Promise<TodayStats> {
 
     return data.reduce(
       (acc, row) => ({
-        runCount:         acc.runCount + 1,
-        spamDeleted:      acc.spamDeleted + (row.spam_deleted ?? 0),
-        welcomeCommented: acc.welcomeCommented + (row.welcome_commented ?? 0),
-        postsChecked:     acc.postsChecked + (row.posts_checked ?? 0),
+        runCount:     acc.runCount + 1,
+        spamDeleted:  acc.spamDeleted + (row.spam_deleted ?? 0),
+        welcomeSent:  acc.welcomeSent + (row.welcome_sent ?? 0),
+        postsChecked: acc.postsChecked + (row.posts_checked ?? 0),
       }),
       defaultStats
     );
@@ -80,9 +82,6 @@ export async function fetchTodayStats(): Promise<TodayStats> {
 }
 
 // ── 최근 실행 로그 ───────────────────────────────────────────
-/**
- * 봇 실행 이력 최근 N건 조회
- */
 export async function fetchRecentRunLogs(limit = 10): Promise<BotRunLog[]> {
   try {
     const supabase = getSupabaseClient();
@@ -101,9 +100,6 @@ export async function fetchRecentRunLogs(limit = 10): Promise<BotRunLog[]> {
 }
 
 // ── 스팸 목록 ────────────────────────────────────────────────
-/**
- * 삭제된 스팸 댓글 최근 N건 조회
- */
 export async function fetchRecentSpamLogs(limit = 20): Promise<SpamLog[]> {
   try {
     const supabase = getSupabaseClient();
@@ -122,9 +118,6 @@ export async function fetchRecentSpamLogs(limit = 20): Promise<SpamLog[]> {
 }
 
 // ── 환영 댓글 목록 ───────────────────────────────────────────
-/**
- * 작성된 환영 댓글 최근 N건 조회
- */
 export async function fetchRecentWelcomeLogs(limit = 20): Promise<WelcomeLog[]> {
   try {
     const supabase = getSupabaseClient();
