@@ -1,0 +1,92 @@
+/* ============================================================
+   파일명: globals.css
+   경로:   cafe-bot-dashboard/app/globals.css
+   역할:   전역 스타일 — Tailwind 지시문, 폰트 로드, 커스텀 유틸리티
+   작성일: 2026-03-10
+   ============================================================ */
+
+/* ── Tailwind CSS 지시문 ───────────────────────────────────── */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── 웹폰트 로드 ──────────────────────────────────────────── */
+/* Pretendard: 한국어 최적화 본문 폰트 */
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css');
+
+/* JetBrains Mono: 숫자/코드 전용 폰트 */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* ── 기본 리셋 ─────────────────────────────────────────────── */
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    font-family: "Pretendard Variable", "Pretendard", "Apple SD Gothic Neo",
+                 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    color: #E6EDF3;
+    background-color: #0D1117;
+  }
+
+  body {
+    min-height: 100vh;
+    line-height: 1.6;
+  }
+
+  /* 스크롤바 커스텀 (다크 테마) */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0D1117;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #30363D;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #484F58;
+  }
+}
+
+/* ── 커스텀 유틸리티 클래스 ──────────────────────────────────── */
+@layer components {
+  /* 카드 공통 스타일 */
+  .card {
+    @apply bg-[#1C2128] border border-[#30363D] rounded-xl p-4;
+  }
+
+  /* 섹션 제목 */
+  .section-title {
+    @apply text-sm font-semibold text-[#E6EDF3] mb-3;
+  }
+
+  /* 숫자/코드 전용 폰트 */
+  .font-stat {
+    font-family: "JetBrains Mono", monospace;
+  }
+
+  /* 카드 진입 애니메이션 */
+  .animate-enter {
+    animation: fadeIn 0.4s ease-out forwards;
+  }
+}
+
+/* ── 키프레임 (Tailwind config과 동기화) ────────────────────── */
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
