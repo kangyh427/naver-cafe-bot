@@ -1,8 +1,14 @@
 // ============================================================
 // 파일명: StatCards.tsx
-// 경로:   cafe-bot-dashboard/components/dashboard/StatCards.tsx
+// 경로:   naver-cafe-bot/components/dashboard/StatCards.tsx
 // 역할:   오늘 통계 4개 카드 (실행 횟수, 스팸 삭제, 환영 댓글, 게시글)
+//
 // 작성일: 2026-03-10
+// 수정일: 2026-03-10
+// 버전:   v1.1
+//
+// [v1.1 — 2026-03-10]
+//   Bug Fix: welcomeCommented → welcomeSent (DB 컬럼명 일치)
 // ============================================================
 
 import { TodayStats } from "@/lib/types";
@@ -16,8 +22,8 @@ interface CardConfig {
   label:    string;
   value:    number;
   icon:     string;
-  color:    string; // 숫자 강조 색상
-  bgColor:  string; // 아이콘 배경
+  color:    string;
+  bgColor:  string;
 }
 
 export default function StatCards({ stats, isLoading }: StatCardsProps) {
@@ -38,7 +44,7 @@ export default function StatCards({ stats, isLoading }: StatCardsProps) {
     },
     {
       label:   "환영 댓글",
-      value:   stats.welcomeCommented,
+      value:   stats.welcomeSent,
       icon:    "💬",
       color:   "text-[#3FB950]",
       bgColor: "bg-[#1A4A2A]",
@@ -59,14 +65,11 @@ export default function StatCards({ stats, isLoading }: StatCardsProps) {
           key={card.label}
           className="card animate-enter flex flex-col gap-3"
         >
-          {/* 아이콘 */}
           <div
             className={`w-9 h-9 rounded-lg ${card.bgColor} flex items-center justify-center text-lg`}
           >
             {card.icon}
           </div>
-
-          {/* 숫자 */}
           <div>
             {isLoading ? (
               <div className="h-7 w-12 bg-[#30363D] rounded animate-pulse-soft" />
