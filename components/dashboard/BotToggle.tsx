@@ -1,14 +1,14 @@
 // ============================================================
 // 파일명: BotToggle.tsx
-// 경로:   cafe-bot-dashboard/components/dashboard/BotToggle.tsx
+// 경로:   naver-cafe-bot/components/dashboard/BotToggle.tsx
 // 역할:   봇 수동 실행 트리거 버튼 + 마지막 실행 상태 표시
 //
-// 동작:
-//   - 버튼 클릭 → /api/trigger-bot POST → GitHub Actions workflow_dispatch
-//   - 실행 중 로딩 스피너 표시 (중복 클릭 방지)
-//   - 성공/실패 토스트 메시지
-//
 // 작성일: 2026-03-10
+// 수정일: 2026-03-10
+// 버전:   v1.1
+//
+// [v1.1 — 2026-03-10]
+//   Bug Fix: welcome_commented → welcome_sent (DB 컬럼명 일치)
 // ============================================================
 
 "use client";
@@ -19,15 +19,14 @@ import Badge from "@/components/ui/Badge";
 import { BotRunLog } from "@/lib/types";
 
 interface BotToggleProps {
-  lastRun:   BotRunLog | null;
-  onTriggered: () => void; // 트리거 성공 후 데이터 새로고침
+  lastRun:     BotRunLog | null;
+  onTriggered: () => void;
 }
 
 export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
   const [isTriggering, setIsTriggering] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  // 마지막 실행 상태 → Badge variant 변환
   const statusVariant = () => {
     if (!lastRun) return "neutral";
     switch (lastRun.status) {
@@ -48,7 +47,6 @@ export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
     }
   };
 
-  // GitHub Actions 수동 트리거
   const handleTrigger = async () => {
     if (isTriggering) return;
     setIsTriggering(true);
@@ -60,7 +58,6 @@ export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
 
       if (res.ok && data.success) {
         setMessage({ type: "success", text: "봇 실행이 요청되었습니다. 약 1~2분 후 결과가 반영됩니다." });
-        // 10초 후 데이터 새로고침
         setTimeout(() => {
           onTriggered();
           setMessage(null);
@@ -80,19 +77,17 @@ export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
       <p className="section-title">봇 제어</p>
 
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        {/* 마지막 실행 상태 */}
         <div className="flex items-center gap-3">
-          <Badge variant={statusVariant()} dot>
+          <Badge variant={statusVariant() as "success" | "warning" | "error" | "neutral"} dot>
             {statusLabel()}
           </Badge>
           {lastRun && (
             <span className="text-xs text-[#8B949E]">
-              스팸 {lastRun.spam_deleted}건 · 환영 {lastRun.welcome_commented}건
+              스팸 {lastRun.spam_deleted}건 · 환영 {lastRun.welcome_sent}건
             </span>
           )}
         </div>
 
-        {/* 수동 실행 버튼 */}
         <button
           onClick={handleTrigger}
           disabled={isTriggering}
@@ -120,7 +115,6 @@ export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
         </button>
       </div>
 
-      {/* 메시지 */}
       {message && (
         <p
           className={`
