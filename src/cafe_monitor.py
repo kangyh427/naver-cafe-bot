@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # 상수
 # ──────────────────────────────────────────
 CAFE_URL          = os.environ.get("CAFE_URL", "https://cafe.naver.com/alexstock")
-POSTS_TO_MONITOR  = 30           # 수집 후 날짜 필터링하므로 여유있게 수집
+POSTS_TO_MONITOR  = 15           # 수집 후 날짜 필터링하므로 여유있게 수집
 PAGE_LOAD_WAIT_S  = 3.0
 ACTION_DELAY_S    = 1.5
 POST_MAX_AGE_HOURS = 24          # 24시간 이내 게시글만 처리
