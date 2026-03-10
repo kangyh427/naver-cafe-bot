@@ -1,8 +1,16 @@
 // ============================================================
 // 파일명: RunTimeline.tsx
-// 경로:   cafe-bot-dashboard/components/dashboard/RunTimeline.tsx
+// 경로:   naver-cafe-bot/components/dashboard/RunTimeline.tsx
 // 역할:   봇 최근 실행 이력 타임라인 (최근 10건)
+//
 // 작성일: 2026-03-10
+// 수정일: 2026-03-10
+// 버전:   v1.1
+//
+// [v1.1 — 2026-03-10]
+//   Bug Fix: DB 컬럼명 일치
+//     - welcome_commented → welcome_sent
+//     - run_duration_sec 제거 (DB에 없음)
 // ============================================================
 
 import { format } from "date-fns";
@@ -15,8 +23,7 @@ interface RunTimelineProps {
   isLoading: boolean;
 }
 
-// 실행 상태 → Badge 설정 변환
-function getStatusConfig(status: BotRunLog["status"]) {
+function getStatusConfig(status: string) {
   switch (status) {
     case "success":
       return { variant: "success" as const, label: "성공" };
@@ -34,7 +41,6 @@ export default function RunTimeline({ logs, isLoading }: RunTimelineProps) {
     <div className="card animate-enter">
       <p className="section-title">최근 실행 이력</p>
 
-      {/* 로딩 스켈레톤 */}
       {isLoading && (
         <div className="space-y-3">
           {Array.from({ length: 4 }).map((_, i) => (
@@ -43,22 +49,17 @@ export default function RunTimeline({ logs, isLoading }: RunTimelineProps) {
         </div>
       )}
 
-      {/* 데이터 없음 */}
       {!isLoading && logs.length === 0 && (
         <p className="text-sm text-[#484F58] text-center py-6">
           실행 이력이 없습니다.
         </p>
       )}
 
-      {/* 타임라인 목록 */}
       {!isLoading && logs.length > 0 && (
         <div className="space-y-2">
           {logs.map((log, idx) => {
             const { variant, label } = getStatusConfig(log.status);
             const runTime = format(new Date(log.run_at), "MM/dd HH:mm", { locale: ko });
-            const duration = log.run_duration_sec
-              ? `${log.run_duration_sec.toFixed(0)}초`
-              : "-";
 
             return (
               <div
@@ -93,10 +94,7 @@ export default function RunTimeline({ logs, isLoading }: RunTimelineProps) {
                     스팸 <span className="font-stat">{log.spam_deleted}</span>
                   </span>
                   <span className="text-xs text-[#3FB950]">
-                    환영 <span className="font-stat">{log.welcome_commented}</span>
-                  </span>
-                  <span className="text-xs text-[#484F58] hidden sm:block font-stat">
-                    {duration}
+                    환영 <span className="font-stat">{log.welcome_sent}</span>
                   </span>
                 </div>
               </div>
