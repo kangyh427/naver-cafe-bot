@@ -327,7 +327,9 @@ async def run_monitor(page: Page) -> MonitorResult:
                     spam_flag, reason = is_spam(
                         comment_text=comment.content,
                         post_context=post.title,
+                        comment_author=comment.author,
                     )
+
 
                     if spam_flag:
                         deleted = await delete_spam_comment(page, post, comment)
