@@ -1,14 +1,9 @@
 // ============================================================
 // 파일명: BotToggle.tsx
-// 경로:   naver-cafe-bot/components/dashboard/BotToggle.tsx
-// 역할:   봇 수동 실행 트리거 버튼 + 마지막 실행 상태 표시
+// 경로:   cafe-bot-dashboard/components/dashboard/BotToggle.tsx
 //
-// 작성일: 2026-03-10
-// 수정일: 2026-03-10
-// 버전:   v1.1
-//
-// [v1.1 — 2026-03-10]
-//   Bug Fix: welcome_commented → welcome_sent (DB 컬럼명 일치)
+// 수정일: 2026-03-11 (v1.2)
+// [v1.2] welcome_commented → welcome_sent (types.ts 동기화)
 // ============================================================
 
 "use client";
@@ -51,17 +46,12 @@ export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
     if (isTriggering) return;
     setIsTriggering(true);
     setMessage(null);
-
     try {
-      const res = await fetch("/api/trigger-bot", { method: "POST" });
+      const res  = await fetch("/api/trigger-bot", { method: "POST" });
       const data = await res.json();
-
       if (res.ok && data.success) {
         setMessage({ type: "success", text: "봇 실행이 요청되었습니다. 약 1~2분 후 결과가 반영됩니다." });
-        setTimeout(() => {
-          onTriggered();
-          setMessage(null);
-        }, 10000);
+        setTimeout(() => { onTriggered(); setMessage(null); }, 10000);
       } else {
         setMessage({ type: "error", text: data.message ?? "실행 요청 실패" });
       }
@@ -75,56 +65,25 @@ export default function BotToggle({ lastRun, onTriggered }: BotToggleProps) {
   return (
     <div className="card animate-enter">
       <p className="section-title">봇 제어</p>
-
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div className="flex items-center gap-3">
-          <Badge variant={statusVariant() as "success" | "warning" | "error" | "neutral"} dot>
-            {statusLabel()}
-          </Badge>
+          <Badge variant={statusVariant() as any} dot>{statusLabel()}</Badge>
           {lastRun && (
             <span className="text-xs text-[#8B949E]">
               스팸 {lastRun.spam_deleted}건 · 환영 {lastRun.welcome_sent}건
             </span>
           )}
         </div>
-
         <button
           onClick={handleTrigger}
           disabled={isTriggering}
-          className="
-            flex items-center justify-center gap-2
-            w-full sm:w-auto
-            px-4 py-2.5
-            bg-[#2EA043] hover:bg-[#3FB950]
-            disabled:bg-[#1A4A2A] disabled:cursor-not-allowed
-            text-white text-sm font-semibold
-            rounded-lg transition-colors duration-200
-          "
+          className="flex items-center justify-center gap-2 w-full sm:w-auto px-4 py-2.5 bg-[#2EA043] hover:bg-[#3FB950] disabled:bg-[#1A4A2A] disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-colors duration-200"
         >
-          {isTriggering ? (
-            <>
-              <Loader2 size={15} className="animate-spin" />
-              실행 중...
-            </>
-          ) : (
-            <>
-              <Play size={15} />
-              지금 실행
-            </>
-          )}
+          {isTriggering ? <><Loader2 size={15} className="animate-spin" />실행 중...</> : <><Play size={15} />지금 실행</>}
         </button>
       </div>
-
       {message && (
-        <p
-          className={`
-            mt-3 text-xs px-3 py-2 rounded-lg
-            ${message.type === "success"
-              ? "bg-[#1A4A2A] text-[#3FB950]"
-              : "bg-[#3D0A0A] text-[#F85149]"
-            }
-          `}
-        >
+        <p className={`mt-3 text-xs px-3 py-2 rounded-lg ${message.type === "success" ? "bg-[#1A4A2A] text-[#3FB950]" : "bg-[#3D0A0A] text-[#F85149]"}`}>
           {message.text}
         </p>
       )}
