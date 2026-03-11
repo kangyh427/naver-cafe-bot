@@ -129,13 +129,18 @@ def is_post_processed(post_url: str) -> bool:
         return False
 
 
-def mark_post_processed(post_url: str, post_author: str) -> bool:
-    """처리 완료 게시글 URL 등록"""
+def mark_post_processed(post_url: str, post_author: str = "") -> bool:
+    """
+    처리 완료 게시글 URL 등록
+
+    DB 실제 컬럼: id, post_url, post_type, processed_at
+    (post_author 컬럼 없음 → post_type에 'welcome'으로 저장)
+    """
     try:
         supabase = get_supabase()
         supabase.table("processed_posts").insert({
-            "post_url":    post_url,
-            "post_author": post_author,
+            "post_url":     post_url,
+            "post_type":    "welcome",
             "processed_at": _now_iso(),
         }).execute()
         return True
