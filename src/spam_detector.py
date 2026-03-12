@@ -46,7 +46,7 @@ SPAM_MEDIUM_CONFIDENCE = 0.70
 # Gemini 호출 속도 제한 가드
 # ──────────────────────────────────────────
 _call_timestamps: list[float] = []
-RATE_LIMIT_PER_MIN = 12
+RATE_LIMIT_PER_MIN = 5
 GEMINI_MAX_RETRY   = 2
 GEMINI_RETRY_BASE  = 30
 
