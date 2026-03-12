@@ -25,7 +25,7 @@
 #   저녁 20:00~20:59 중 임의 1회
 #
 # 안전장치:
-#   - timeout-minutes: 75 (59분 대기 + 15분 실행)
+#   - timeout-minutes: 40  (20분 대기 + 15분 실행 + 5분 여유)
 #   - ubuntu-22.04 고정 (OS 패키지 오류 방지)
 #   - concurrency: 동시 실행 방지
 #   - 수동 실행 시 랜덤 딜레이 스킵 (즉시 실행)
@@ -50,7 +50,7 @@ jobs:
   run-cafe-bot:
     runs-on: ubuntu-22.04
     # 최대 59분 대기 + 15분 실행 = 74분 → 75분으로 설정
-    timeout-minutes: 75
+    timeout-minutes: 40
 
     concurrency:
       group: cafe-bot-run
@@ -78,7 +78,7 @@ jobs:
       - name: 🎲 랜덤 딜레이 (봇 탐지 회피)
         if: github.event_name == 'schedule'
         run: |
-          DELAY=$((RANDOM % 3600))
+          DELAY=$((RANDOM % 901 + 300))
           MINUTES=$((DELAY / 60))
           SECS=$((DELAY % 60))
           echo "=============================="
