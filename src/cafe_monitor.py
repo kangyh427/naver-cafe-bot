@@ -1,23 +1,24 @@
 # ============================================================
 # 파일명: cafe_monitor.py
-# 경로:   kangyh427/naver_cafe_bot/src/cafe_monitor.py
-# 역할:   네이버 카페 게시글/댓글 수집 + 스팸 댓글 삭제
+# 경로:   kangyh427/naver-cafe-bot/src/cafe_monitor.py
+# 역할:   네이버 카페 게시글/댓글 수집 + 스팸/사칭 댓글 삭제
 #
 # 작성일: 2026-03-09
-# 수정일: 2026-03-12
-# 버전:   v4.0
+# 수정일: 2026-03-13
+# 버전:   v5.0
+#
+# [v5.0 — 2026-03-13] 삭제 로직 근본 재설계
+#   버그 수정 1: dialog 핸들러를 클릭 후에 등록하던 치명적 오류 수정
+#               → 클릭 전 등록으로 변경 (확인 대화창 놓치던 문제 해결)
+#   버그 수정 2: FrameLocator 방식 → page.frames Frame 객체 방식으로 통일
+#               comment_dom.py와 동일한 Frame 접근 방식 사용
+#   버그 수정 3: 댓글 삭제 시 data-comment-id 기반 selector 우선 사용
+#               → nth-child 방식보다 신뢰성 대폭 향상
+#   개선: 삭제 버튼 selector 다수 추가 (네이버 카페 다양한 DOM 대응)
+#   개선: 재탐색 로직 추가 (삭제 전 해당 게시글 페이지 위치 확인)
 #
 # [v4.0 — 2026-03-12] 댓글 24시간 필터 추가
-#   문제: 게시글당 모든 댓글을 Gemini로 판별 → 429 할당량 초과 반복
-#   수정:
-#     - CommentInfo에 commented_at 필드 추가
-#     - collect_comments()에서 댓글 작성 날짜 파싱
-#     - 24시간 이내 댓글만 스팸 판별 대상으로 수집
-#     - 오래된 댓글은 이미 검토됐다고 판단, 스킵
-#   효과: Gemini 호출 횟수 대폭 감소 → 429 오류 원천 차단
-#
 # [v3.0 — 2026-03-11] 근본 재설계 (selector 확장, URL 정규화)
-# [v2.1 — 2026-03-10] 게시글 24h 필터 도입
 # [v1.0 — 2026-03-09] 최초 작성
 # ============================================================
 
@@ -47,7 +48,7 @@ PAGE_LOAD_WAIT_S   = 3.5
 ACTION_DELAY_S     = 1.5
 POST_MAX_AGE_HOURS = 24
 
-# 네이버 카페 게시글 목록 selector 후보
+# 게시글 목록 selector 후보
 POST_LINK_SELECTORS = [
     "a.article",
     ".article-board a[href*='ArticleRead']",
@@ -56,7 +57,6 @@ POST_LINK_SELECTORS = [
     "a[href*='ArticleRead']",
 ]
 
-# 작성자 selector 후보
 AUTHOR_SELECTORS = [
     "td.td_name .m-tcol-c",
     "td.td_name",
@@ -64,14 +64,12 @@ AUTHOR_SELECTORS = [
     ".td_name",
 ]
 
-# 날짜 selector 후보 (게시글 목록)
 DATE_SELECTORS = [
     "td.td_date",
     ".td_date",
     "td[class*='date']",
 ]
 
-# 댓글 날짜 selector 후보 (v4.0 추가)
 COMMENT_DATE_SELECTORS = [
     ".comment_info_date",
     ".comment_date",
@@ -80,17 +78,29 @@ COMMENT_DATE_SELECTORS = [
     "em.date",
 ]
 
+# v5.0: 삭제 버튼 selector 목록 (우선순위 순)
+DELETE_BTN_SELECTORS = [
+    ".btn_delete",
+    ".comment_delete",
+    ".ico_delete",
+    ".u_cbox_btn_delete",
+    "button[class*='delete']",
+    "a[class*='delete']",
+    ".comment_option .delete",
+    ".opt_comment .delete",
+]
+
 
 # ──────────────────────────────────────────
 # 데이터 구조
 # ──────────────────────────────────────────
 @dataclass
 class CommentInfo:
-    comment_id:          str
-    author:              str
-    content:             str
-    commented_at:        Optional[datetime] = None   # v4.0 추가
-    delete_btn_selector: Optional[str] = None
+    comment_id:   str
+    author:       str
+    content:      str
+    commented_at: Optional[datetime] = None
+    item_index:   int = 0           # v5.0: nth-child 계산용 (0-based)
 
 @dataclass
 class PostInfo:
@@ -110,19 +120,51 @@ class MonitorResult:
 
 
 # ──────────────────────────────────────────
-# iframe 안전 획득
+# v5.0: Frame 객체 획득 (comment_dom.py와 동일 방식으로 통일)
 # ──────────────────────────────────────────
-async def _get_fresh_frame(page: Page):
+async def _get_frame_object(page: Page):
     """
-    페이지 로드 완료 후 항상 새 frame 참조 획득
-    안전장치: iframe 없으면 page 직접 반환
+    cafe_main iframe의 실제 Frame 객체 획득
+    FrameLocator(액션 불가)가 아닌 Frame 객체 반환
+
+    순서: iframe 대기 → URL 매칭 → name 매칭 → page 폴백
+    안전장치: 최대 3회 재시도 (iframe 로딩 지연 대응)
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
-        frame = page.frame_locator("iframe#cafe_main").first
-        return frame
-    except Exception:
-        logger.debug("[monitor] iframe 없음 → page 직접 사용")
+
+        # iframe이 DOM에 나타날 때까지 최대 5초 대기
+        try:
+            await page.wait_for_selector("iframe#cafe_main", timeout=5000)
+        except Exception:
+            pass
+
+        # 1차: URL 기반 탐색 (가장 신뢰, 최대 3회 재시도)
+        for attempt in range(3):
+            for frame in page.frames:
+                if ("cafe.naver.com" in frame.url or
+                    "ca-fe.naver.com" in frame.url or
+                    "ArticleRead" in frame.url):
+                    logger.debug(f"[monitor] Frame 발견(URL): {frame.url[:60]}")
+                    return frame
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+
+        # 2차: name 기반
+        named_frame = page.frame(name="cafe_main")
+        if named_frame:
+            logger.debug("[monitor] Frame 발견(name=cafe_main)")
+            return named_frame
+
+        # 3차: 폴백 — page 직접 사용
+        logger.debug(
+            f"[monitor] iframe 미발견 → page 직접 사용 "
+            f"(총 {len(page.frames)}개 frame)"
+        )
+        return page
+
+    except Exception as e:
+        logger.debug(f"[monitor] Frame 획득 예외 → page 폴백: {e}")
         return page
 
 
@@ -130,12 +172,6 @@ async def _get_fresh_frame(page: Page):
 # URL 정규화
 # ──────────────────────────────────────────
 def _normalize_cafe_url(href: str, base_url: str = "https://cafe.naver.com") -> Optional[str]:
-    """
-    네이버 카페 게시글 URL 정규화
-    - 상대경로 → 절대경로
-    - 쿼리스트링 포함 ArticleRead URL 처리
-    - iframe 파라미터 제거
-    """
     if not href:
         return None
     if href.startswith("javascript:") or href == "#":
@@ -161,84 +197,50 @@ def _normalize_cafe_url(href: str, base_url: str = "https://cafe.naver.com") -> 
 
 
 # ──────────────────────────────────────────
-# 날짜 파싱 (게시글 & 댓글 공용)
+# 날짜 파싱
 # ──────────────────────────────────────────
 def _parse_post_date(date_text: str) -> Optional[datetime]:
-    """
-    네이버 날짜 텍스트 → datetime 변환
-    지원 형식:
-      "2026.03.10."  → 해당 날짜
-      "03.10."       → 올해 해당 날짜
-      "10:59"        → 오늘
-    안전장치: 파싱 실패 시 None → 호출부에서 포함(True) 처리
-    """
     now  = datetime.now(timezone.utc)
     text = date_text.strip().rstrip('.')
-
     try:
         parts = text.split('.')
         if len(parts) >= 3:
-            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
-            return datetime(year, month, day, tzinfo=timezone.utc)
+            return datetime(int(parts[0]), int(parts[1]), int(parts[2]), tzinfo=timezone.utc)
         if len(parts) == 2:
-            month, day = int(parts[0]), int(parts[1])
-            return datetime(now.year, month, day, tzinfo=timezone.utc)
+            return datetime(now.year, int(parts[0]), int(parts[1]), tzinfo=timezone.utc)
         if ':' in text:
             return now.replace(hour=0, minute=0, second=0, microsecond=0)
     except (ValueError, IndexError):
         pass
-
     return None
 
 
 def _parse_comment_date(date_text: str) -> Optional[datetime]:
-    """
-    댓글 날짜 파싱 (v4.0 신규)
-    네이버 댓글 날짜 형식:
-      "2026.03.12. 14:38"  → datetime
-      "03.12. 10:30"       → 올해 datetime
-      "10:38"              → 오늘
-    안전장치: 파싱 실패 시 None → 24h 이내로 간주 (스팸 판별 누락 방지)
-    """
     now  = datetime.now(timezone.utc)
     text = date_text.strip()
-
     try:
-        # "2026.03.12. 14:38" 형식
         if '.' in text and ':' in text:
             date_part, time_part = text.rsplit(' ', 1)
             date_part = date_part.strip().rstrip('.')
             parts = date_part.split('.')
             hour, minute = map(int, time_part.split(':'))
-
             if len(parts) >= 3:
                 year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
             elif len(parts) == 2:
                 year, month, day = now.year, int(parts[0]), int(parts[1])
             else:
                 return None
-
             return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
-
-        # "10:38" 형식 (오늘)
         if ':' in text and '.' not in text:
             hour, minute = map(int, text.split(':'))
             return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-        # 날짜만 있는 경우 → _parse_post_date 재사용
         return _parse_post_date(text)
-
     except (ValueError, IndexError, AttributeError):
         pass
-
     return None
 
 
 def _is_within_24h(dt: Optional[datetime]) -> bool:
-    """
-    24시간 이내인지 확인
-    안전장치: None → True (누락 방지 우선)
-    """
     if dt is None:
         return True
     cutoff = datetime.now(timezone.utc) - timedelta(hours=POST_MAX_AGE_HOURS)
@@ -249,25 +251,20 @@ def _is_within_24h(dt: Optional[datetime]) -> bool:
 # 게시글 목록 수집
 # ──────────────────────────────────────────
 async def collect_recent_posts(page: Page) -> list[PostInfo]:
-    """
-    전체글 보기에서 최신 게시글 수집 후 24시간 이내만 반환
-    """
     posts: list[PostInfo] = []
-
     try:
         await page.goto(CAFE_URL, timeout=25000, wait_until="domcontentloaded")
         await asyncio.sleep(PAGE_LOAD_WAIT_S)
 
-        frame = await _get_fresh_frame(page)
+        frame = await _get_frame_object(page)
 
-        # 게시글 링크 수집
         post_links = []
         for selector in POST_LINK_SELECTORS:
             try:
                 links = await frame.locator(selector).all()
                 if links:
                     post_links = links
-                    logger.info(f"[monitor] 게시글 링크 selector 성공: '{selector}' → {len(links)}개")
+                    logger.info(f"[monitor] 게시글 selector 성공: '{selector}' → {len(links)}개")
                     break
             except Exception as e:
                 logger.debug(f"[monitor] selector 실패 '{selector}': {e}")
@@ -275,23 +272,14 @@ async def collect_recent_posts(page: Page) -> list[PostInfo]:
 
         if not post_links:
             logger.error("[monitor] 게시글 링크를 찾을 수 없음 — 모든 selector 실패")
-            try:
-                body_text = await page.locator("body").text_content(timeout=3000)
-                logger.debug(f"[monitor] 페이지 body 앞부분: {body_text[:300] if body_text else '없음'}")
-            except Exception:
-                pass
             return posts
 
-        # 각 링크에서 URL/제목/작성자/날짜 추출
         for link in post_links[:POSTS_TO_MONITOR]:
             try:
                 href  = await link.get_attribute("href") or ""
-                title = (await link.text_content() or "제목없음").strip()
-                title = title.replace("\n", " ").strip()
-
-                url = _normalize_cafe_url(href)
+                title = (await link.text_content() or "제목없음").strip().replace("\n", " ")
+                url   = _normalize_cafe_url(href)
                 if not url:
-                    logger.debug(f"[monitor] URL 정규화 실패, 스킵: href='{href[:80]}'")
                     continue
 
                 author = "알수없음"
@@ -317,20 +305,16 @@ async def collect_recent_posts(page: Page) -> list[PostInfo]:
                         continue
 
                 posts.append(PostInfo(url=url, title=title, author=author, posted_at=posted_at))
-                logger.debug(f"[monitor] 게시글 수집: '{title[:30]}' | {author}")
 
             except Exception as e:
-                logger.debug(f"[monitor] 게시글 링크 파싱 실패: {e}")
+                logger.debug(f"[monitor] 게시글 파싱 실패: {e}")
                 continue
 
-        # 24시간 이내 필터링
         before_filter = len(posts)
         posts = [p for p in posts if _is_within_24h(p.posted_at)]
-        skipped = before_filter - len(posts)
-
         logger.info(
             f"[monitor] 게시글 수집 완료 | "
-            f"전체:{before_filter} 24h이내:{len(posts)} 날짜필터스킵:{skipped}"
+            f"전체:{before_filter} 24h이내:{len(posts)} 스킵:{before_filter - len(posts)}"
         )
 
     except Exception as e:
@@ -340,24 +324,39 @@ async def collect_recent_posts(page: Page) -> list[PostInfo]:
 
 
 # ──────────────────────────────────────────
-# 댓글 수집 (v4.0: 24h 필터 추가)
+# 댓글 수집
 # ──────────────────────────────────────────
 async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
     """
-    게시글 페이지에서 댓글 수집
-    v4.0: 24시간 이내 댓글만 반환 → Gemini 호출 최소화
+    게시글 댓글 수집 (24h 이내만)
+    v5.0: item_index 저장으로 삭제 시 정확한 위치 파악
     """
     comments: list[CommentInfo] = []
 
-    COMMENT_ITEM_SELECTORS    = [".comment_list li.CommentItem", ".comment-list li", ".CommentBox li"]
-    COMMENT_AUTHOR_SELECTORS  = [".comment_nickname .nick", ".comment_nickname", ".nick", ".m-tcol-c"]
-    COMMENT_CONTENT_SELECTORS = [".comment_text_box .comment_text", ".comment_text_box", ".comment_body", ".comment_text"]
+    COMMENT_ITEM_SELECTORS = [
+        ".comment_list li.CommentItem",
+        ".comment-list li",
+        ".CommentBox li",
+        "li.CommentItem",
+    ]
+    COMMENT_AUTHOR_SELECTORS = [
+        ".comment_nickname .nick",
+        ".comment_nickname",
+        ".nick",
+        ".m-tcol-c",
+    ]
+    COMMENT_CONTENT_SELECTORS = [
+        ".comment_text_box .comment_text",
+        ".comment_text_box",
+        ".comment_body",
+        ".comment_text",
+    ]
 
     try:
         await page.goto(post.url, timeout=25000, wait_until="domcontentloaded")
         await asyncio.sleep(PAGE_LOAD_WAIT_S)
 
-        frame = await _get_fresh_frame(page)
+        frame = await _get_frame_object(page)
 
         comment_items = []
         for sel in COMMENT_ITEM_SELECTORS:
@@ -374,14 +373,19 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
             logger.debug(f"[monitor] 댓글 없음: {post.url[-50:]}")
             return comments
 
-        total_comments   = len(comment_items)
-        skipped_old      = 0
+        total_comments = len(comment_items)
+        skipped_old   = 0
 
         for idx, item in enumerate(comment_items):
             try:
-                comment_id = await item.get_attribute("data-comment-id") or f"idx_{idx}"
+                # data-comment-id 우선, 없으면 data-id, 최후에 idx_N
+                comment_id = (
+                    await item.get_attribute("data-comment-id") or
+                    await item.get_attribute("data-id") or
+                    f"idx_{idx}"
+                )
 
-                # ── 댓글 날짜 추출 (v4.0 신규) ──
+                # 댓글 날짜 추출
                 commented_at = None
                 for date_sel in COMMENT_DATE_SELECTORS:
                     try:
@@ -392,7 +396,6 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
                     except Exception:
                         continue
 
-                # ── 24시간 이내 댓글만 처리 ──
                 if not _is_within_24h(commented_at):
                     skipped_old += 1
                     continue
@@ -422,17 +425,12 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
                 if not content:
                     continue
 
-                delete_selector = (
-                    f"li.CommentItem:nth-child({idx + 1}) .btn_delete, "
-                    f"li.CommentItem:nth-child({idx + 1}) .comment_delete"
-                )
-
                 comments.append(CommentInfo(
                     comment_id=comment_id,
                     author=author,
                     content=content,
                     commented_at=commented_at,
-                    delete_btn_selector=delete_selector,
+                    item_index=idx,
                 ))
 
             except Exception as e:
@@ -440,8 +438,8 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
                 continue
 
         logger.debug(
-            f"[monitor] 댓글 수집 완료 | "
-            f"전체:{total_comments} 24h이내:{len(comments)} 오래된댓글스킵:{skipped_old} "
+            f"[monitor] 댓글 수집 | "
+            f"전체:{total_comments} 24h이내:{len(comments)} 오래된:{skipped_old} "
             f"— '{post.title[:25]}'"
         )
 
@@ -452,32 +450,97 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
 
 
 # ──────────────────────────────────────────
-# 스팸 댓글 삭제
+# 스팸/사칭 댓글 삭제 (v5.0 핵심 수정)
 # ──────────────────────────────────────────
 async def delete_spam_comment(page: Page, post: PostInfo, comment: CommentInfo) -> bool:
-    """스팸 댓글 관리자 삭제"""
-    try:
-        frame = await _get_fresh_frame(page)
+    """
+    스팸/사칭 댓글 관리자 삭제
 
-        delete_btn = frame.locator(comment.delete_btn_selector).first
-        if not await delete_btn.is_visible(timeout=5000):
-            logger.warning(f"[monitor] 삭제 버튼 없음: {comment.author}")
+    v5.0 핵심 수정:
+      [버그수정] dialog 핸들러 → 클릭 전 등록 (기존: 클릭 후 등록)
+      [버그수정] FrameLocator → Frame 객체 방식으로 통일
+      [개선] data-comment-id 기반 정확한 버튼 탐색 (1순위)
+      [개선] nth-child 기반 탐색 (2순위, item_index 활용)
+      [개선] 게시글 페이지 위치 확인 후 필요 시 재이동
+    """
+    try:
+        # 현재 페이지가 대상 게시글인지 확인 후 필요 시 재이동
+        current_url = page.url
+        if post.url not in current_url and current_url not in post.url:
+            logger.debug(f"[monitor] 게시글 재이동: {post.url[-60:]}")
+            await page.goto(post.url, timeout=25000, wait_until="domcontentloaded")
+            await asyncio.sleep(PAGE_LOAD_WAIT_S)
+
+        frame = await _get_frame_object(page)
+
+        # ── 삭제 버튼 탐색: 전략 1 — data-comment-id ──
+        delete_btn = None
+
+        if comment.comment_id and not comment.comment_id.startswith("idx_"):
+            id_selectors = [
+                f"[data-comment-id='{comment.comment_id}'] .btn_delete",
+                f"[data-comment-id='{comment.comment_id}'] .comment_delete",
+                f"[data-id='{comment.comment_id}'] .btn_delete",
+                f"li[data-comment-id='{comment.comment_id}'] button[class*='delete']",
+                f"li[data-comment-id='{comment.comment_id}'] a[class*='delete']",
+            ]
+            for sel in id_selectors:
+                try:
+                    btn = frame.locator(sel).first
+                    if await btn.is_visible(timeout=3000):
+                        delete_btn = btn
+                        logger.debug(f"[monitor] 삭제버튼 발견(comment-id): '{sel}'")
+                        break
+                except Exception:
+                    continue
+
+        # ── 삭제 버튼 탐색: 전략 2 — nth-child (item_index 활용) ──
+        if delete_btn is None:
+            nth = comment.item_index + 1
+            ITEM_PARENT_SELECTORS = [
+                "li.CommentItem",
+                ".comment_list li",
+                ".CommentBox li",
+            ]
+            for item_sel in ITEM_PARENT_SELECTORS:
+                for del_sel in DELETE_BTN_SELECTORS:
+                    try:
+                        full_sel = f"{item_sel}:nth-child({nth}) {del_sel}"
+                        btn = frame.locator(full_sel).first
+                        if await btn.is_visible(timeout=2000):
+                            delete_btn = btn
+                            logger.debug(f"[monitor] 삭제버튼 발견(nth): '{full_sel}'")
+                            break
+                    except Exception:
+                        continue
+                if delete_btn:
+                    break
+
+        if delete_btn is None:
+            logger.warning(
+                f"[monitor] 삭제 버튼 미발견: '{comment.author}' "
+                f"(관리자 권한 확인 필요 또는 selector 불일치)"
+            )
             return False
 
+        # ── [v5.0 핵심 수정] dialog 핸들러를 클릭 전에 등록 ──
+        async def _handle_dialog(dialog):
+            logger.debug(f"[monitor] 삭제 확인 다이얼로그 수락: '{dialog.message[:50]}'")
+            await dialog.accept()
+
+        page.once("dialog", _handle_dialog)   # ← 반드시 클릭 전에 등록
+
         await delete_btn.click()
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(2.0)              # 다이얼로그 처리 + 페이지 반영 대기
 
-        try:
-            page.once("dialog", lambda d: asyncio.create_task(d.accept()))
-        except Exception:
-            pass
-
-        await asyncio.sleep(random.uniform(1.0, 2.0))
-        logger.info(f"[monitor] 스팸 삭제 완료: {comment.author} — '{comment.content[:30]}'")
+        logger.info(
+            f"[monitor] ✅ 삭제 완료: "
+            f"'{comment.author}' — '{comment.content[:40]}'"
+        )
         return True
 
     except Exception as e:
-        logger.error(f"[monitor] 댓글 삭제 실패: {e}")
+        logger.error(f"[monitor] 댓글 삭제 실패: {e}", exc_info=True)
         return False
 
 
@@ -487,10 +550,6 @@ async def delete_spam_comment(page: Page, post: PostInfo, comment: CommentInfo) 
 async def run_monitor(page: Page) -> MonitorResult:
     """
     전체 모니터링 실행 — main.py에서 호출하는 단일 진입점
-
-    v4.0:
-      - collect_comments()가 24h 이내 댓글만 반환
-      - Gemini 호출 횟수 대폭 감소
     """
     result = MonitorResult()
 
@@ -503,10 +562,9 @@ async def run_monitor(page: Page) -> MonitorResult:
 
     for post in posts:
         result.posts_checked += 1
-        logger.debug(f"[monitor] 처리 중 ({result.posts_checked}/{len(posts)}): '{post.title[:30]}'")
+        logger.info(f"[monitor] 처리 중 ({result.posts_checked}/{len(posts)}): '{post.title[:30]}'")
 
         try:
-            # 댓글 수집 (24h 이내만)
             comments = await collect_comments(page, post)
             post.comments = comments
 
@@ -519,6 +577,9 @@ async def run_monitor(page: Page) -> MonitorResult:
                     )
 
                     if spam_flag:
+                        logger.info(
+                            f"[monitor] 감지: '{comment.author}' | 사유: {reason}"
+                        )
                         deleted = await delete_spam_comment(page, post, comment)
                         if deleted:
                             result.spam_deleted += 1
@@ -536,9 +597,9 @@ async def run_monitor(page: Page) -> MonitorResult:
             # 환영 댓글 대상 판단
             if not is_post_processed(post.url):
                 result.new_post_urls.append(post.url)
-                logger.debug(f"[monitor] 신규 게시글 등록: {post.author} — '{post.title[:30]}'")
+                logger.debug(f"[monitor] 환영 대상 등록: '{post.title[:30]}'")
             else:
-                logger.debug(f"[monitor] 이미 처리된 게시글 스킵: {post.url[-50:]}")
+                logger.debug(f"[monitor] 이미 처리됨 스킵: {post.url[-50:]}")
 
             await asyncio.sleep(random.uniform(ACTION_DELAY_S, ACTION_DELAY_S + 1.5))
 
@@ -549,6 +610,6 @@ async def run_monitor(page: Page) -> MonitorResult:
     logger.info(
         f"[monitor] 완료 | "
         f"게시글:{result.posts_checked} 스팸삭제:{result.spam_deleted} "
-        f"신규(환영대상):{len(result.new_post_urls)} 오류:{result.errors}"
+        f"환영대상:{len(result.new_post_urls)} 오류:{result.errors}"
     )
     return result
