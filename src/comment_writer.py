@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # 상수
 # ──────────────────────────────────────────
 BOT_NICKNAMES     = ["AlexKang", "알렉스강"]
-PAGE_LOAD_WAIT_S  = 4.0          # 댓글창 렌더링 충분히 대기
+PAGE_LOAD_WAIT_S  = 6.0          # v5.1: fe.naver.com U_cbox 초기화 대기 (4.0→6.0초)
 COMMENT_MIN_LEN   = 20
 COMMENT_MAX_LEN   = 150
 MAX_CONSECUTIVE_FAILURES = 3     # 연속 실패 한도 (안전장치)

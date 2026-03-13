@@ -6,26 +6,24 @@
 #
 # 작성일: 2026-03-11
 # 수정일: 2026-03-13
-# 버전:   v4.0
+# 버전:   v5.0
 #
-# [v4.0 — 2026-03-13] fe.naver.com + U_cbox 시스템 대응
+# [v5.0 — 2026-03-13] U_cbox 비동기 로드 대기 로직 추가
 #   원인 확정:
-#     게시글 URL이 fe.naver.com/ArticleRead.nhn?... 형식으로 이동됨
-#     → 이 경우 iframe#cafe_main 없이 페이지 자체가 게시글
-#     → 댓글창도 기존 comment_inbox_text 가 아닌
-#       네이버 U_cbox 시스템 (textarea.u_cbox_text) 사용
-#     → 기존 selector 전부 실패 → "댓글 입력창 없음" 반복
+#     fe.naver.com에서 U_cbox 댓글 시스템이 JS로 비동기 초기화됨
+#     → 페이지 로드 완료(domcontentloaded) 시점에 댓글창이 DOM에 없음
+#     → _find_textarea_in_any_frame()이 모든 frame을 뒤져도 못 찾음
 #   수정:
-#     - U_cbox selector 우선 추가 (textarea.u_cbox_text 등)
-#     - U_cbox 제출 버튼 selector 추가 (.u_cbox_btn_upload 등)
-#     - _find_textarea_in_any_frame(): 모든 frame 순회 탐색 신규 추가
-#       중첩 iframe (U_cbox가 별도 iframe에 로드되는 경우) 대응
-#     - fe.naver.com frame URL 탐색 추가
+#     - _wait_for_comment_area(): 모든 frame을 폴링하며 댓글창 출현 대기
+#       최대 15초 대기, 1초 간격으로 재확인 (비동기 로드 완전 대응)
+#     - submit_comment() 진입 시 _wait_for_comment_area() 먼저 호출
+#     - 스크롤 후 추가 3초 대기 (lazy rendering 완전 대응)
 #   안전장치:
-#     - 기존 selector도 유지 (하위 호환)
+#     - 15초 후에도 없으면 _find_textarea_in_any_frame()으로 최후 시도
 #     - 전체 frame 디버그 로그 강화
 #
-# [v3.0 — 2026-03-13] iframe 재시도, Ctrl+Enter 폴백 추가
+# [v4.0 — 2026-03-13] fe.naver.com/U_cbox selector 추가 + 전체 frame 탐색
+# [v3.0 — 2026-03-13] iframe 재시도, Ctrl+Enter 폴백
 # [v2.0 — 2026-03-11] frame_locator → page.frames Frame 객체 방식
 # [v1.0 — 2026-03-09] 최초 작성
 # ============================================================
@@ -48,7 +46,6 @@ TITLE_SELECTORS = [
     ".tit_subject",
     "h3.tit_h3",
 ]
-
 CONTENT_SELECTORS = [
     ".se-main-container",
     ".se-text-paragraph",
@@ -56,7 +53,6 @@ CONTENT_SELECTORS = [
     ".article_body",
     ".se-module-text",
 ]
-
 AUTHOR_SELECTORS = [
     ".writer-nick-wrap .nick",
     ".cafe-nick-name",
@@ -65,31 +61,41 @@ AUTHOR_SELECTORS = [
     ".nick",
 ]
 
-# v4.0: U_cbox 시스템 selector 우선 추가
+# v5.0: 댓글창 출현 감지용 (대기에 사용, 가벼운 selector 우선)
+COMMENT_AREA_WAIT_SELECTORS = [
+    ".u_cbox_write",
+    "textarea.u_cbox_text",
+    "#cbox_module",
+    ".comment_inbox",
+    ".CommentWriter",
+    "textarea[placeholder*='댓글']",
+]
+
+# 실제 textarea 탐색용 (더 구체적)
 COMMENT_INPUT_SELECTORS = [
-    # ── U_cbox 시스템 (fe.naver.com / 신규 카페) ──
+    # U_cbox 시스템 (fe.naver.com / 신규 카페)
     "textarea.u_cbox_text",
     "#cbox_module textarea",
     ".u_cbox_write textarea",
     ".u_cbox_write_box textarea",
     ".u_cbox_write_inner textarea",
-    # ── 기존 시스템 (cafe.naver.com / 구형 카페) ──
+    # 기존 시스템 (cafe.naver.com / 구형 카페)
     "textarea.comment_inbox_text",
     "textarea[placeholder*='댓글']",
     ".comment_inbox textarea",
     ".CommentWriter textarea",
-    # ── 최후 폴백 ──
+    # 최후 폴백
     "textarea",
 ]
 
-# v4.0: U_cbox 제출 버튼 selector 우선 추가
+# 제출 버튼 탐색용
 COMMENT_SUBMIT_SELECTORS = [
-    # ── U_cbox 시스템 ──
+    # U_cbox 시스템
     ".u_cbox_btn_upload",
     "button.u_cbox_btn_upload",
     ".u_cbox_write_submit button",
     "button[class*='upload']",
-    # ── 기존 시스템 ──
+    # 기존 시스템
     ".register_box button",
     ".register_box .btn_register",
     ".btn_write_comment",
@@ -99,13 +105,11 @@ COMMENT_SUBMIT_SELECTORS = [
 
 
 # ──────────────────────────────────────────
-# Frame 객체 획득 (v4.0: fe.naver.com 추가)
+# Frame 객체 획득
 # ──────────────────────────────────────────
 async def _get_cafe_frame(page: Page):
     """
-    cafe_main 또는 게시글 Frame 객체 획득
-
-    v4.0: fe.naver.com URL 탐색 추가
+    게시글 Frame 객체 획득
     순서: iframe 대기 → URL 매칭(3회 재시도) → name 매칭 → page 폴백
     """
     try:
@@ -114,32 +118,25 @@ async def _get_cafe_frame(page: Page):
         try:
             await page.wait_for_selector("iframe#cafe_main", timeout=5000)
         except Exception:
-            logger.debug("[dom] iframe#cafe_main 미발견 (fe.naver.com 직접 접근 가능)")
+            logger.debug("[dom] iframe#cafe_main 미발견 (fe.naver.com 직접 접근)")
 
-        # 1차: URL 기반 탐색 (3회 재시도)
         for attempt in range(3):
             for frame in page.frames:
                 if ("cafe.naver.com" in frame.url or
                     "ca-fe.naver.com" in frame.url or
-                    "fe.naver.com" in frame.url or      # v4.0 추가
+                    "fe.naver.com" in frame.url or
                     "ArticleRead" in frame.url):
                     logger.debug(f"[dom] Frame 발견(URL): {frame.url[:70]}")
                     return frame
             if attempt < 2:
                 await asyncio.sleep(1.0)
-                logger.debug(f"[dom] Frame 재탐색 ({attempt + 2}/3)...")
 
-        # 2차: name 기반
         named_frame = page.frame(name="cafe_main")
         if named_frame:
             logger.debug("[dom] Frame 발견(name=cafe_main)")
             return named_frame
 
-        # 3차: page 폴백
-        logger.warning(
-            f"[dom] iframe 미발견 → page 직접 사용 "
-            f"(총 {len(page.frames)}개 frame)"
-        )
+        logger.warning(f"[dom] iframe 미발견 → page 직접 사용 ({len(page.frames)}개 frame)")
         for i, f in enumerate(page.frames):
             logger.debug(f"[dom]   frame[{i}] url='{f.url[:80]}'")
         return page
@@ -150,13 +147,46 @@ async def _get_cafe_frame(page: Page):
 
 
 # ──────────────────────────────────────────
-# v4.0 신규: 전체 frame 순회 텍스트 입력창 탐색
+# v5.0 핵심: 댓글창 출현 대기 (폴링 방식)
+# ──────────────────────────────────────────
+async def _wait_for_comment_area(page: Page, timeout_sec: float = 15.0) -> bool:
+    """
+    모든 frame을 폴링하며 댓글 입력창이 나타날 때까지 대기
+
+    fe.naver.com에서 U_cbox가 JS로 비동기 초기화되므로
+    domcontentloaded 후에도 바로 탐색하면 못 찾음
+    → 1초 간격 폴링으로 실제 출현 시점 감지
+
+    Returns: True (발견) / False (타임아웃)
+    """
+    logger.info(f"[dom] 댓글창 출현 대기 시작 (최대 {timeout_sec:.0f}초)...")
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+
+    while asyncio.get_event_loop().time() < deadline:
+        for frame in page.frames:
+            for sel in COMMENT_AREA_WAIT_SELECTORS:
+                try:
+                    el = frame.locator(sel).first
+                    if await el.is_visible(timeout=800):
+                        logger.info(
+                            f"[dom] 댓글창 출현 감지: "
+                            f"frame='{frame.url[:50]}' sel='{sel}'"
+                        )
+                        return True
+                except Exception:
+                    continue
+        await asyncio.sleep(1.0)
+
+    logger.warning(f"[dom] 댓글창 출현 대기 타임아웃 ({timeout_sec:.0f}초) — 강제 진행")
+    return False
+
+
+# ──────────────────────────────────────────
+# 전체 frame 순회 textarea 탐색
 # ──────────────────────────────────────────
 async def _find_textarea_in_any_frame(page: Page):
     """
     모든 frame을 순회하여 댓글 입력창 탐색
-    U_cbox가 별도 중첩 iframe에 로드되는 경우 대응
-
     Returns: (frame, element) 또는 (None, None)
     """
     for frame in page.frames:
@@ -165,7 +195,7 @@ async def _find_textarea_in_any_frame(page: Page):
                 el = frame.locator(sel).first
                 if await el.is_visible(timeout=1500):
                     logger.info(
-                        f"[dom] 입력창 발견 (전체 frame 탐색): "
+                        f"[dom] 입력창 발견(전체 탐색): "
                         f"frame='{frame.url[:50]}' sel='{sel}'"
                     )
                     return frame, el
@@ -193,20 +223,19 @@ async def _find_el(target, selectors: list, label: str):
 async def _debug_frames(page: Page):
     """실패 시 전체 frame 상태 디버그"""
     try:
-        logger.debug("[dom] === Frame 디버그 시작 ===")
+        logger.debug("[dom] === Frame 디버그 ===")
         for fi, frame in enumerate(page.frames):
             try:
                 fta = await frame.locator("textarea").all()
                 logger.debug(
-                    f"[dom] frame[{fi}] url='{frame.url[:60]}' "
-                    f"textarea:{len(fta)}개"
+                    f"[dom] frame[{fi}] url='{frame.url[:60]}' textarea:{len(fta)}개"
                 )
                 for i, ta in enumerate(fta[:3]):
-                    cls         = await ta.get_attribute("class") or ""
-                    placeholder = await ta.get_attribute("placeholder") or ""
-                    logger.debug(f"[dom]   [{i}] class='{cls}' ph='{placeholder}'")
+                    cls = await ta.get_attribute("class") or ""
+                    ph  = await ta.get_attribute("placeholder") or ""
+                    logger.debug(f"[dom]   [{i}] class='{cls}' ph='{ph}'")
             except Exception:
-                logger.debug(f"[dom] frame[{fi}] url='{frame.url[:60]}' 탐색 실패")
+                logger.debug(f"[dom] frame[{fi}] url='{frame.url[:60]}' 탐색 불가")
         logger.debug("[dom] === Frame 디버그 종료 ===")
     except Exception:
         pass
@@ -241,35 +270,38 @@ async def read_post_content(page: Page) -> tuple:
 
 
 # ──────────────────────────────────────────
-# 댓글 입력 및 제출 (v4.0: U_cbox + 전체 frame 탐색)
+# 댓글 입력 및 제출 (v5.0: 비동기 로드 대기 추가)
 # ──────────────────────────────────────────
 async def submit_comment(page: Page, comment_text: str) -> bool:
     """
     댓글 입력창 탐색 → 텍스트 입력 → 제출
 
-    v4.0 핵심 수정:
-      - U_cbox selector 우선 시도 (fe.naver.com 대응)
-      - 1차 탐색 실패 시 _find_textarea_in_any_frame() 으로
-        모든 frame 순회 탐색 (중첩 iframe U_cbox 대응)
-      - 제출: 버튼 클릭 → Ctrl+Enter 폴백
+    v5.0 핵심 수정:
+      1. _wait_for_comment_area(): 댓글창 출현까지 폴링 대기 (최대 15초)
+         fe.naver.com U_cbox 비동기 초기화 완전 대응
+      2. 스크롤 후 추가 3초 대기 (lazy rendering 완전 대응)
+      3. 1차 탐색 실패 시 _find_textarea_in_any_frame() 전체 탐색
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
-        # 페이지 하단 스크롤 → 댓글창 lazy rendering 강제 로드
+        # ── 1단계: 하단 스크롤 → 댓글창 lazy rendering 유발 ──
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)   # 스크롤 후 추가 대기 (v5.0: 1.5→2.0초)
         except Exception:
             pass
 
-        # ── 1차: cafe frame 안에서 입력창 탐색 ──
+        # ── 2단계: 댓글창 출현까지 폴링 대기 (v5.0 핵심 추가) ──
+        await _wait_for_comment_area(page, timeout_sec=15.0)
+
+        # ── 3단계: cafe frame 안에서 1차 탐색 ──
         frame    = await _get_cafe_frame(page)
         input_el = await _find_el(frame, COMMENT_INPUT_SELECTORS, "댓글 입력창")
 
-        # ── 2차: 전체 frame 순회 탐색 (중첩 U_cbox iframe 대응) ──
+        # ── 4단계: 전체 frame 순회 2차 탐색 ──
         if input_el is None:
-            logger.info("[dom] 1차 탐색 실패 → 전체 frame 순회 탐색 시작")
+            logger.info("[dom] 1차 탐색 실패 → 전체 frame 순회 탐색")
             frame, input_el = await _find_textarea_in_any_frame(page)
 
         if input_el is None:
