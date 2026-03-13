@@ -6,7 +6,19 @@
 #
 # 작성일: 2026-03-11
 # 수정일: 2026-03-13
-# 버전:   v5.1
+# 버전:   v5.2
+#
+# [v5.2 — 2026-03-13] textarea 활성화 클릭 추가 (ca-fe.naver.com 근본 원인 해결)
+#   문제 확인 (실제 Actions 로그):
+#     [dom] 댓글창 출현 감지: sel='.CommentWriter' ← 컨테이너 발견
+#     [dom] 댓글 입력창 없음 — 모든 selector 실패 ← textarea는 hidden!
+#   원인:
+#     ca-fe.naver.com에서 textarea는 기본 display:none 상태
+#     → .CommentWriter는 보이지만 내부 textarea는 not visible
+#     → is_visible() 검사에서 COMMENT_INPUT_SELECTORS 전부 실패
+#   수정:
+#     _activate_comment_area(): frame 결정 후, textarea 탐색 전에
+#     .comment_inbox 클릭 → 클릭 후 1.5초 대기 → textarea visible 상태 전환
 #
 # [v5.1 — 2026-03-13] 핵심 버그 2개 수정
 #   버그 수정 1: _wait_for_comment_area() 반환값 활용 누락
@@ -285,27 +297,71 @@ async def read_post_content(page: Page) -> tuple:
 
 
 # ──────────────────────────────────────────
-# 댓글 입력 및 제출 (v5.1: frame 재활용 + frame 내부 스크롤 추가)
+# v5.2: 댓글창 클릭 활성화 (ca-fe.naver.com 전용)
+# ──────────────────────────────────────────
+
+# ca-fe.naver.com에서 textarea는 기본 hidden → 이 영역을 클릭해야 active됨
+COMMENT_ACTIVATOR_SELECTORS = [
+    ".comment_inbox",            # 구형/ca-fe.naver.com 댓글 입력 영역
+    ".CommentWriter .comment_inbox",
+    ".u_cbox_write",             # U_cbox 입력 영역
+    ".u_cbox_write_area",
+    ".CommentWriter",            # 최후 폴백 (컨테이너 전체 클릭)
+]
+
+
+async def _activate_comment_area(frame, label_url: str = "") -> bool:
+    """
+    댓글창을 클릭하여 textarea를 활성화(hidden → visible)
+
+    ca-fe.naver.com에서 textarea는 기본적으로 display:none 상태.
+    .comment_inbox 등의 컨테이너를 클릭해야 textarea가 나타남.
+
+    Returns: True (활성화 성공 가능성 있음) / False (클릭 실패)
+    """
+    for sel in COMMENT_ACTIVATOR_SELECTORS:
+        try:
+            el = frame.locator(sel).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                logger.info(
+                    f"[dom] 댓글창 클릭 활성화: '{sel}' "
+                    f"frame='{label_url[:40]}'"
+                )
+                await asyncio.sleep(1.5)   # textarea가 나타날 때까지 대기
+                return True
+        except Exception:
+            continue
+    logger.debug("[dom] 댓글창 활성화 클릭 실패 (무시 — 이미 활성화 상태일 수 있음)")
+    return False
+
+
+# ──────────────────────────────────────────
+# 댓글 입력 및 제출 (v5.2: textarea 활성화 클릭 추가)
 # ──────────────────────────────────────────
 async def submit_comment(page: Page, comment_text: str) -> bool:
     """
     댓글 입력창 탐색 → 텍스트 입력 → 제출
 
-    [v5.1 핵심 수정 2가지]
-      수정 1: _wait_for_comment_area()가 반환한 frame 직접 사용
-        기존: 반환값 무시 → _get_cafe_frame() 재호출 → 잘못된 frame 반환 가능
-        수정: 반환된 (frame, el)에서 frame을 직접 재활용
-              → cafe.naver.com 외부 페이지 대신 실제 콘텐츠 frame 보장
+    [v5.2 핵심 수정]
+      문제 확인 (실제 Actions 로그):
+        [dom] 댓글창 출현 감지: frame='ca-fe.naver.com/...' sel='.CommentWriter'
+        [dom] 댓글 입력창 없음 — 모든 selector 실패
+      원인:
+        ca-fe.naver.com에서 textarea는 기본 display:none 상태
+        → .CommentWriter는 보이지만 textarea는 hidden
+        → is_visible(timeout=3000) 검사에서 모두 실패
+      수정:
+        frame 결정 후, textarea 탐색 전에 .comment_inbox 클릭
+        → 클릭으로 textarea 활성화(hidden→visible) 후 탐색
 
-      수정 2: 감지된 frame 내부도 스크롤
-        기존: page.evaluate("window.scrollTo...") → 외부 페이지 스크롤만
-        수정: 감지된 frame이 iframe이면 frame 내부에서도 스크롤 실행
-              → 내부 iframe 안의 U_cbox lazy rendering 완전 대응
+    [v5.1 수정 유지]
+      - _wait_for_comment_area() 반환 frame 직접 사용
+      - frame 내부 스크롤
 
-    [v5.0 유지 사항]
-      - 15초 폴링 대기 (U_cbox 비동기 초기화 대응)
-      - 1차 탐색 실패 시 _find_textarea_in_any_frame() 전체 순회 폴백
-      - type() → fill() → Ctrl+Enter 3단계 제출 폴백
+    [v5.0 유지]
+      - 15초 폴링 대기, 전체 frame 순회 폴백
+      - type() → fill() → Ctrl+Enter 3단계 폴백
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -320,11 +376,10 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
         # ── 2단계: 댓글창 출현 폴링 대기 (v5.1: frame 정보 반환) ──
         wait_result = await _wait_for_comment_area(page, timeout_sec=15.0)
 
-        # ── 3단계: 감지된 frame 내부도 스크롤 (v5.1 핵심 추가) ──
+        # ── 3단계: 감지된 frame 내부도 스크롤 (v5.1) ──
         detected_frame = None
         if wait_result:
             detected_frame, _ = wait_result
-            # 외부 페이지와 다른 frame(iframe)인 경우에만 내부 스크롤 실행
             if detected_frame and len(page.frames) > 1:
                 try:
                     await detected_frame.evaluate(
@@ -337,15 +392,26 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
                 except Exception as scroll_err:
                     logger.debug(f"[dom] frame 내부 스크롤 불가 (무시): {scroll_err}")
 
-        # ── 4단계: 탐색 대상 frame 결정 (v5.1 핵심: detected_frame 우선 사용) ──
-        # detected_frame이 있으면 그 frame에서 textarea 탐색
-        # 없으면 _get_cafe_frame() 폴백 (타임아웃 시)
-        frame    = detected_frame if detected_frame else await _get_cafe_frame(page)
+        # ── 4단계: 탐색 대상 frame 결정 ──
+        frame = detected_frame if detected_frame else await _get_cafe_frame(page)
+
+        # ── 4.5단계: 댓글창 클릭 활성화 (v5.2 핵심 추가) ──
+        # ca-fe.naver.com에서 textarea는 기본 hidden → 클릭해야 visible
+        await _activate_comment_area(
+            frame,
+            label_url=detected_frame.url if detected_frame else "",
+        )
+
+        # ── 5단계: 활성화 후 textarea 탐색 ──
         input_el = await _find_el(frame, COMMENT_INPUT_SELECTORS, "댓글 입력창")
 
-        # ── 5단계: 전체 frame 순회 2차 탐색 (최후 안전장치) ──
+        # ── 6단계: 전체 frame 순회 2차 탐색 (최후 안전장치) ──
         if input_el is None:
             logger.info("[dom] 1차 탐색 실패 → 전체 frame 순회 탐색")
+            # 다른 frame들에도 활성화 클릭 시도
+            for f in page.frames:
+                if f != frame:
+                    await _activate_comment_area(f, label_url=f.url)
             frame, input_el = await _find_textarea_in_any_frame(page)
 
         if input_el is None:
