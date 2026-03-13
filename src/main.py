@@ -33,6 +33,12 @@ from comment_writer import run_comment_writer
 from supabase_logger import log_bot_run
 
 # ──────────────────────────────────────────
+# 기능 플래그 (임시 비활성화 시 False로 설정)
+# ──────────────────────────────────────────
+ENABLE_COMMENT_WRITING = False   # ← 댓글 작성 비활성화 (DOM 수정 중)
+ENABLE_SPAM_DELETION   = False   # ← 삭제도 비활성화 (감지+알림만 운영)
+
+# ──────────────────────────────────────────
 # 로깅 설정
 # ──────────────────────────────────────────
 logging.basicConfig(
@@ -100,9 +106,12 @@ async def run_bot() -> int:
         async with get_logged_in_page() as page:
             logger.info("[main] 네이버 로그인 완료 — 모니터링 시작")
 
-            # 3. 카페 모니터링 (스팸 감지/삭제)
+            # 3. 카페 모니터링 (스팸 감지 / 조건부 삭제)
             try:
-                monitor_result = await run_monitor(page)
+                monitor_result = await run_monitor(
+                    page,
+                    enable_deletion=ENABLE_SPAM_DELETION,
+                )
                 posts_checked  = monitor_result.posts_checked
                 spam_deleted   = monitor_result.spam_deleted
                 error_count   += monitor_result.errors
@@ -110,7 +119,10 @@ async def run_bot() -> int:
 
                 logger.info(
                     f"[main] 모니터링 완료 | "
-                    f"게시글:{posts_checked} 스팸:{spam_deleted} 오류:{monitor_result.errors}"
+                    f"게시글:{posts_checked} "
+                    f"스팸감지:{monitor_result.spam_detected} "
+                    f"스팸삭제:{spam_deleted} "
+                    f"오류:{monitor_result.errors}"
                 )
             except Exception as e:
                 logger.error(f"[main] 모니터링 단계 오류: {e}")
@@ -118,8 +130,12 @@ async def run_bot() -> int:
                 new_post_urls = []
                 status = "partial_error"
 
-            # 4. 환영 댓글 작성
-            if new_post_urls:
+            # 4. 환영 댓글 작성 (현재 비활성화)
+            if not ENABLE_COMMENT_WRITING:
+                logger.info(
+                    "[main] 환영 댓글 작성 비활성화 상태 (ENABLE_COMMENT_WRITING=False)"
+                )
+            elif new_post_urls:
                 try:
                     welcome_commented = await run_comment_writer(page, new_post_urls)
                     logger.info(f"[main] 환영 댓글 완료 | 작성:{welcome_commented}개")

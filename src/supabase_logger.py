@@ -58,6 +58,39 @@ def _now_iso() -> str:
 # ──────────────────────────────────────────
 # 스팸 로그 저장
 # ──────────────────────────────────────────
+def log_spam_detected(
+    post_url: str,
+    comment_author: str,
+    comment_content: str,
+    spam_reason: str,
+    ai_confidence: Optional[float] = None,
+    keyword_matched: Optional[str] = None,
+) -> bool:
+    """
+    스팸 댓글 감지 기록 저장 (삭제 여부와 무관하게 즉시 저장)
+
+    기존 log_spam_deleted()는 삭제 성공 시에만 호출됨
+    → 삭제 실패해도 감지 사실을 기록하기 위해 별도 함수로 분리
+    spam_reason 앞에 "[감지]" 접두어를 붙여 대시보드에서 구분 가능
+    """
+    try:
+        supabase = get_supabase()
+        supabase.table("spam_logs").insert({
+            "post_url":        post_url,
+            "comment_author":  comment_author,
+            "comment_content": comment_content[:1000],
+            "spam_reason":     f"[감지] {spam_reason}",
+            "ai_confidence":   ai_confidence,
+            "keyword_matched": keyword_matched,
+            "deleted_at":      _now_iso(),   # 감지 시각 기록
+        }).execute()
+        logger.info(f"[logger] 스팸 감지 로그 저장: {comment_author}")
+        return True
+    except Exception as e:
+        logger.error(f"[logger] 스팸 감지 로그 저장 실패: {e}")
+        return False
+
+
 def log_spam_deleted(
     post_url: str,
     comment_author: str,
@@ -78,11 +111,29 @@ def log_spam_deleted(
             "keyword_matched": keyword_matched,
             "deleted_at":      _now_iso(),
         }).execute()
-        logger.info(f"[logger] 스팸 로그 저장 완료: {comment_author}")
+        logger.info(f"[logger] 스팸 삭제 로그 저장 완료: {comment_author}")
         return True
     except Exception as e:
         logger.error(f"[logger] 스팸 로그 저장 실패: {e}")
         return False
+
+
+def write_github_summary(markdown: str) -> None:
+    """
+    GitHub Actions Job Summary에 마크다운 리포트 작성
+    Actions 실행 결과 탭에서 바로 확인 가능
+    """
+    import os
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(markdown + "\n")
+        except Exception as e:
+            logger.error(f"[logger] GitHub Summary 작성 실패: {e}")
+    else:
+        # 로컬 실행 시 — 로그로 출력
+        logger.info(f"[GitHub Summary]\n{markdown}")
 
 
 # ──────────────────────────────────────────

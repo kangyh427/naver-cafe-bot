@@ -42,7 +42,12 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from playwright.async_api import Page
 
 from spam_detector import is_spam
-from supabase_logger import log_spam_deleted, is_post_processed
+from supabase_logger import (
+    log_spam_detected,
+    log_spam_deleted,
+    is_post_processed,
+    write_github_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +137,12 @@ class PostInfo:
 
 @dataclass
 class MonitorResult:
-    posts_checked: int = 0
-    spam_deleted:  int = 0
-    errors:        int = 0
-    new_post_urls: list[str] = field(default_factory=list)
+    posts_checked:  int = 0
+    spam_detected:  int = 0   # 감지된 스팸 수 (삭제 여부 무관)
+    spam_deleted:   int = 0   # 실제 삭제된 스팸 수
+    errors:         int = 0
+    new_post_urls:  list[str] = field(default_factory=list)
+    detected_items: list[dict] = field(default_factory=list)  # 감지 상세 (GitHub Summary용)
 
 
 # ──────────────────────────────────────────
@@ -616,9 +623,11 @@ async def delete_spam_comment(page: Page, post: PostInfo, comment: CommentInfo) 
 # ──────────────────────────────────────────
 # 메인 모니터링 실행
 # ──────────────────────────────────────────
-async def run_monitor(page: Page) -> MonitorResult:
+async def run_monitor(page: Page, enable_deletion: bool = True) -> MonitorResult:
     """
     전체 모니터링 실행 — main.py에서 호출하는 단일 진입점
+
+    enable_deletion=False 시: 스팸 감지 + 로그만 수행 (DOM 삭제 시도 안 함)
     """
     result = MonitorResult()
 
@@ -646,17 +655,43 @@ async def run_monitor(page: Page) -> MonitorResult:
                     )
 
                     if spam_flag:
-                        logger.info(
-                            f"[monitor] 감지: '{comment.author}' | 사유: {reason}"
+                        result.spam_detected += 1
+                        logger.warning(
+                            f"[monitor] 🚨 스팸 감지 #{result.spam_detected}: "
+                            f"'{comment.author}' | 사유: {reason} | "
+                            f"내용: '{comment.content[:50]}'"
                         )
-                        deleted = await delete_spam_comment(page, post, comment)
-                        if deleted:
-                            result.spam_deleted += 1
-                            log_spam_deleted(
-                                post_url=post.url,
-                                comment_author=comment.author,
-                                comment_content=comment.content,
-                                spam_reason=reason,
+
+                        # ── 감지 즉시 Supabase 저장 (삭제 여부와 무관) ──
+                        log_spam_detected(
+                            post_url=post.url,
+                            comment_author=comment.author,
+                            comment_content=comment.content,
+                            spam_reason=reason,
+                        )
+
+                        # GitHub Summary 리포트용 상세 수집
+                        result.detected_items.append({
+                            "author":  comment.author,
+                            "content": comment.content[:80],
+                            "reason":  reason,
+                            "post":    post.title[:40],
+                        })
+
+                        # ── 삭제 시도 (enable_deletion=True 일 때만) ──
+                        if enable_deletion:
+                            deleted = await delete_spam_comment(page, post, comment)
+                            if deleted:
+                                result.spam_deleted += 1
+                                log_spam_deleted(
+                                    post_url=post.url,
+                                    comment_author=comment.author,
+                                    comment_content=comment.content,
+                                    spam_reason=reason,
+                                )
+                        else:
+                            logger.info(
+                                f"[monitor] 삭제 비활성화 — 감지만 기록: '{comment.author}'"
                             )
 
                 except Exception as e:
@@ -678,7 +713,47 @@ async def run_monitor(page: Page) -> MonitorResult:
 
     logger.info(
         f"[monitor] 완료 | "
-        f"게시글:{result.posts_checked} 스팸삭제:{result.spam_deleted} "
+        f"게시글:{result.posts_checked} "
+        f"스팸감지:{result.spam_detected} 스팸삭제:{result.spam_deleted} "
         f"환영대상:{len(result.new_post_urls)} 오류:{result.errors}"
     )
+
+    # ── GitHub Actions Job Summary 작성 ──
+    _write_monitor_summary(result)
+
     return result
+
+
+def _write_monitor_summary(result: MonitorResult) -> None:
+    """GitHub Actions Summary 탭에 스팸 감지 리포트 작성"""
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        f"## 🛡️ 카페봇 스팸 감지 리포트 — {now_str}",
+        "",
+        "| 항목 | 수치 |",
+        "|------|------|",
+        f"| 📄 수집 게시글 | {result.posts_checked}개 |",
+        f"| 🚨 스팸 감지 | {result.spam_detected}건 |",
+        f"| 🗑️ 스팸 삭제 | {result.spam_deleted}건 |",
+        f"| ⚠️ 오류 | {result.errors}건 |",
+        "",
+    ]
+
+    if result.detected_items:
+        lines.append("### 감지된 스팸 댓글 목록")
+        lines.append("")
+        lines.append("| # | 작성자 | 내용 | 사유 | 게시글 |")
+        lines.append("|---|--------|------|------|--------|")
+        for i, item in enumerate(result.detected_items, 1):
+            lines.append(
+                f"| {i} | `{item['author']}` "
+                f"| {item['content']} "
+                f"| {item['reason'][:50]} "
+                f"| {item['post']} |"
+            )
+    else:
+        lines.append("✅ **감지된 스팸 없음**")
+
+    write_github_summary("\n".join(lines))
