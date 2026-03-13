@@ -36,7 +36,7 @@ from supabase_logger import log_bot_run
 # 기능 플래그 (임시 비활성화 시 False로 설정)
 # ──────────────────────────────────────────
 ENABLE_COMMENT_WRITING = False   # ← 댓글 작성 비활성화 (DOM 수정 중)
-ENABLE_SPAM_DELETION   = False   # ← 삭제도 비활성화 (감지+알림만 운영)
+ENABLE_SPAM_DELETION   = True    # ← 스팸 감지+삭제 활성화
 
 # ──────────────────────────────────────────
 # 로깅 설정
