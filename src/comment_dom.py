@@ -6,17 +6,27 @@
 #
 # 작성일: 2026-03-11
 # 수정일: 2026-03-13
-# 버전:   v3.0
+# 버전:   v4.0
 #
-# [v3.0 — 2026-03-13] 환영 댓글 0건 문제 근본 수정
-#   버그 수정: iframe URL 탐색 실패 시 폴백이 page라 textarea 못 찾던 문제
-#   개선 1: iframe URL 탐색에 재시도 루프 추가 (3회, 1초 간격)
-#   개선 2: 댓글 입력 전 페이지 하단 스크롤 (lazy rendering 대응)
-#   개선 3: 제출 실패 시 Ctrl+Enter 키보드 폴백 추가
-#   개선 4: 입력 실패 시 type() → fill() 폴백 추가
-#   개선 5: 전체 frame 디버그 로그 강화
+# [v4.0 — 2026-03-13] fe.naver.com + U_cbox 시스템 대응
+#   원인 확정:
+#     게시글 URL이 fe.naver.com/ArticleRead.nhn?... 형식으로 이동됨
+#     → 이 경우 iframe#cafe_main 없이 페이지 자체가 게시글
+#     → 댓글창도 기존 comment_inbox_text 가 아닌
+#       네이버 U_cbox 시스템 (textarea.u_cbox_text) 사용
+#     → 기존 selector 전부 실패 → "댓글 입력창 없음" 반복
+#   수정:
+#     - U_cbox selector 우선 추가 (textarea.u_cbox_text 등)
+#     - U_cbox 제출 버튼 selector 추가 (.u_cbox_btn_upload 등)
+#     - _find_textarea_in_any_frame(): 모든 frame 순회 탐색 신규 추가
+#       중첩 iframe (U_cbox가 별도 iframe에 로드되는 경우) 대응
+#     - fe.naver.com frame URL 탐색 추가
+#   안전장치:
+#     - 기존 selector도 유지 (하위 호환)
+#     - 전체 frame 디버그 로그 강화
 #
-# [v2.0 — 2026-03-11] frame_locator → page.frames Frame 객체 방식으로 수정
+# [v3.0 — 2026-03-13] iframe 재시도, Ctrl+Enter 폴백 추가
+# [v2.0 — 2026-03-11] frame_locator → page.frames Frame 객체 방식
 # [v1.0 — 2026-03-09] 최초 작성
 # ============================================================
 
@@ -28,34 +38,58 @@ from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
 
-# ── Selector 정의 (우선순위 순) ──
+# ── Selector 정의 (U_cbox 우선, 기존 시스템 폴백) ──
+
 TITLE_SELECTORS = [
     ".title-text",
     "h3.title",
     ".ArticleTitle",
     ".article-title",
     ".tit_subject",
+    "h3.tit_h3",
 ]
+
 CONTENT_SELECTORS = [
     ".se-main-container",
     ".se-text-paragraph",
     ".tbody",
     ".article_body",
+    ".se-module-text",
 ]
+
 AUTHOR_SELECTORS = [
     ".writer-nick-wrap .nick",
     ".cafe-nick-name",
     ".writer_info .nick",
     ".m-tcol-c",
+    ".nick",
 ]
+
+# v4.0: U_cbox 시스템 selector 우선 추가
 COMMENT_INPUT_SELECTORS = [
+    # ── U_cbox 시스템 (fe.naver.com / 신규 카페) ──
+    "textarea.u_cbox_text",
+    "#cbox_module textarea",
+    ".u_cbox_write textarea",
+    ".u_cbox_write_box textarea",
+    ".u_cbox_write_inner textarea",
+    # ── 기존 시스템 (cafe.naver.com / 구형 카페) ──
     "textarea.comment_inbox_text",
     "textarea[placeholder*='댓글']",
     ".comment_inbox textarea",
     ".CommentWriter textarea",
-    "textarea",                     # 최후 폴백
+    # ── 최후 폴백 ──
+    "textarea",
 ]
+
+# v4.0: U_cbox 제출 버튼 selector 우선 추가
 COMMENT_SUBMIT_SELECTORS = [
+    # ── U_cbox 시스템 ──
+    ".u_cbox_btn_upload",
+    "button.u_cbox_btn_upload",
+    ".u_cbox_write_submit button",
+    "button[class*='upload']",
+    # ── 기존 시스템 ──
     ".register_box button",
     ".register_box .btn_register",
     ".btn_write_comment",
@@ -65,36 +99,35 @@ COMMENT_SUBMIT_SELECTORS = [
 
 
 # ──────────────────────────────────────────
-# Frame 객체 획득 (v3.0 강화)
+# Frame 객체 획득 (v4.0: fe.naver.com 추가)
 # ──────────────────────────────────────────
 async def _get_cafe_frame(page: Page):
     """
-    iframe#cafe_main의 Frame 객체 획득
-    Frame 객체여야 type(), click() 등 액션 실행 가능
+    cafe_main 또는 게시글 Frame 객체 획득
 
-    v3.0 개선: 재시도 루프 추가, 디버그 강화
+    v4.0: fe.naver.com URL 탐색 추가
     순서: iframe 대기 → URL 매칭(3회 재시도) → name 매칭 → page 폴백
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
-        # iframe이 DOM에 나타날 때까지 최대 5초 대기
         try:
             await page.wait_for_selector("iframe#cafe_main", timeout=5000)
         except Exception:
-            logger.debug("[dom] iframe#cafe_main 미발견 (타임아웃)")
+            logger.debug("[dom] iframe#cafe_main 미발견 (fe.naver.com 직접 접근 가능)")
 
         # 1차: URL 기반 탐색 (3회 재시도)
         for attempt in range(3):
             for frame in page.frames:
                 if ("cafe.naver.com" in frame.url or
                     "ca-fe.naver.com" in frame.url or
+                    "fe.naver.com" in frame.url or      # v4.0 추가
                     "ArticleRead" in frame.url):
-                    logger.debug(f"[dom] Frame 발견(URL): {frame.url[:60]}")
+                    logger.debug(f"[dom] Frame 발견(URL): {frame.url[:70]}")
                     return frame
             if attempt < 2:
                 await asyncio.sleep(1.0)
-                logger.debug(f"[dom] Frame 재탐색 중 ({attempt + 2}/3)...")
+                logger.debug(f"[dom] Frame 재탐색 ({attempt + 2}/3)...")
 
         # 2차: name 기반
         named_frame = page.frame(name="cafe_main")
@@ -102,7 +135,7 @@ async def _get_cafe_frame(page: Page):
             logger.debug("[dom] Frame 발견(name=cafe_main)")
             return named_frame
 
-        # 3차: 폴백 — page 직접 (전체 frame 목록 디버그)
+        # 3차: page 폴백
         logger.warning(
             f"[dom] iframe 미발견 → page 직접 사용 "
             f"(총 {len(page.frames)}개 frame)"
@@ -117,10 +150,34 @@ async def _get_cafe_frame(page: Page):
 
 
 # ──────────────────────────────────────────
+# v4.0 신규: 전체 frame 순회 텍스트 입력창 탐색
+# ──────────────────────────────────────────
+async def _find_textarea_in_any_frame(page: Page):
+    """
+    모든 frame을 순회하여 댓글 입력창 탐색
+    U_cbox가 별도 중첩 iframe에 로드되는 경우 대응
+
+    Returns: (frame, element) 또는 (None, None)
+    """
+    for frame in page.frames:
+        for sel in COMMENT_INPUT_SELECTORS:
+            try:
+                el = frame.locator(sel).first
+                if await el.is_visible(timeout=1500):
+                    logger.info(
+                        f"[dom] 입력창 발견 (전체 frame 탐색): "
+                        f"frame='{frame.url[:50]}' sel='{sel}'"
+                    )
+                    return frame, el
+            except Exception:
+                continue
+    return None, None
+
+
+# ──────────────────────────────────────────
 # 요소 탐색 헬퍼
 # ──────────────────────────────────────────
 async def _find_el(target, selectors: list, label: str):
-    """selector 우선순위 순으로 탐색, 발견 시 반환"""
     for sel in selectors:
         try:
             el = target.locator(sel).first
@@ -134,20 +191,22 @@ async def _find_el(target, selectors: list, label: str):
 
 
 async def _debug_frames(page: Page):
-    """제출 실패 시 전체 frame의 textarea 상태 디버그 출력"""
+    """실패 시 전체 frame 상태 디버그"""
     try:
         logger.debug("[dom] === Frame 디버그 시작 ===")
         for fi, frame in enumerate(page.frames):
             try:
                 fta = await frame.locator("textarea").all()
-                if fta:
-                    logger.debug(f"[dom] frame[{fi}] ({frame.url[:50]}) textarea {len(fta)}개")
-                    for i, ta in enumerate(fta[:3]):
-                        cls         = await ta.get_attribute("class") or ""
-                        placeholder = await ta.get_attribute("placeholder") or ""
-                        logger.debug(f"[dom]   [{i}] class='{cls}' placeholder='{placeholder}'")
+                logger.debug(
+                    f"[dom] frame[{fi}] url='{frame.url[:60]}' "
+                    f"textarea:{len(fta)}개"
+                )
+                for i, ta in enumerate(fta[:3]):
+                    cls         = await ta.get_attribute("class") or ""
+                    placeholder = await ta.get_attribute("placeholder") or ""
+                    logger.debug(f"[dom]   [{i}] class='{cls}' ph='{placeholder}'")
             except Exception:
-                pass
+                logger.debug(f"[dom] frame[{fi}] url='{frame.url[:60]}' 탐색 실패")
         logger.debug("[dom] === Frame 디버그 종료 ===")
     except Exception:
         pass
@@ -182,17 +241,17 @@ async def read_post_content(page: Page) -> tuple:
 
 
 # ──────────────────────────────────────────
-# 댓글 입력 및 제출 (v3.0 강화)
+# 댓글 입력 및 제출 (v4.0: U_cbox + 전체 frame 탐색)
 # ──────────────────────────────────────────
 async def submit_comment(page: Page, comment_text: str) -> bool:
     """
     댓글 입력창 탐색 → 텍스트 입력 → 제출
 
-    v3.0 개선:
-      - 입력 전 페이지 하단 스크롤 (textarea lazy rendering 대응)
-      - 입력 방식: type() 실패 시 fill() 폴백
-      - 제출 방식: 버튼 클릭 실패 시 Ctrl+Enter 키보드 폴백
-      - 성공 검증: 입력창 초기화 여부 확인
+    v4.0 핵심 수정:
+      - U_cbox selector 우선 시도 (fe.naver.com 대응)
+      - 1차 탐색 실패 시 _find_textarea_in_any_frame() 으로
+        모든 frame 순회 탐색 (중첩 iframe U_cbox 대응)
+      - 제출: 버튼 클릭 → Ctrl+Enter 폴백
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -204,11 +263,17 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
         except Exception:
             pass
 
-        frame = await _get_cafe_frame(page)
-
-        # ── 입력창 탐색 ──
+        # ── 1차: cafe frame 안에서 입력창 탐색 ──
+        frame    = await _get_cafe_frame(page)
         input_el = await _find_el(frame, COMMENT_INPUT_SELECTORS, "댓글 입력창")
+
+        # ── 2차: 전체 frame 순회 탐색 (중첩 U_cbox iframe 대응) ──
         if input_el is None:
+            logger.info("[dom] 1차 탐색 실패 → 전체 frame 순회 탐색 시작")
+            frame, input_el = await _find_textarea_in_any_frame(page)
+
+        if input_el is None:
+            logger.error("[dom] 모든 frame에서 댓글 입력창 탐색 실패")
             await _debug_frames(page)
             return False
 
@@ -217,7 +282,6 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
         await asyncio.sleep(random.uniform(0.5, 1.0))
 
         try:
-            # type()은 실제 키보드 타이핑 시뮬레이션 (더 자연스러움)
             await input_el.type(comment_text, delay=random.randint(60, 120))
         except Exception as type_err:
             logger.warning(f"[dom] type() 실패 → fill() 폴백: {type_err}")
@@ -258,9 +322,8 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
             if after_value == "":
                 logger.info("[dom] ✅ 댓글 제출 성공 (입력창 초기화 확인)")
             else:
-                logger.warning(f"[dom] 입력창에 내용 잔류 — 제출 실패 가능")
+                logger.warning("[dom] 입력창 내용 잔류 — 제출 실패 가능성")
         except Exception:
-            # 페이지 리로드 등으로 입력창이 사라진 경우 → 제출 성공으로 판단
             logger.debug("[dom] 입력창 상태 확인 불가 — 제출 성공으로 간주")
 
         return submitted

@@ -5,7 +5,7 @@
 #
 # 작성일: 2026-03-09
 # 수정일: 2026-03-13
-# 버전:   v5.0
+# 버전:   v5.1
 #
 # [v5.0 — 2026-03-13] 삭제 로직 근본 재설계
 #   버그 수정 1: dialog 핸들러를 클릭 후에 등록하던 치명적 오류 수정
@@ -144,6 +144,7 @@ async def _get_frame_object(page: Page):
             for frame in page.frames:
                 if ("cafe.naver.com" in frame.url or
                     "ca-fe.naver.com" in frame.url or
+                    "fe.naver.com" in frame.url or      # v5.1 추가: fe.naver.com 직접 접근 대응
                     "ArticleRead" in frame.url):
                     logger.debug(f"[monitor] Frame 발견(URL): {frame.url[:60]}")
                     return frame
