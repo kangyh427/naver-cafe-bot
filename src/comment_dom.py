@@ -6,22 +6,21 @@
 #
 # 작성일: 2026-03-11
 # 수정일: 2026-03-13
-# 버전:   v5.0
+# 버전:   v5.1
+#
+# [v5.1 — 2026-03-13] 핵심 버그 2개 수정
+#   버그 수정 1: _wait_for_comment_area() 반환값 활용 누락
+#     기존: bool 반환 → submit_comment()가 결과 무시하고 _get_cafe_frame() 재호출
+#           → _get_cafe_frame()이 외부 cafe.naver.com 페이지를 반환할 경우
+#              내부 iframe의 U_cbox textarea를 찾지 못함
+#     수정: Optional[tuple[frame, element]] 반환
+#           → submit_comment()가 반환된 frame을 직접 사용 (재탐색 불필요)
+#   버그 수정 2: 스크롤이 외부 페이지에만 적용
+#     기존: page.evaluate("window.scrollTo(...)") → 외부 페이지만 스크롤
+#           → 내부 iframe 안의 댓글창은 lazy rendering 미발동
+#     수정: _wait_for_comment_area()가 감지한 frame 내부도 추가 스크롤
 #
 # [v5.0 — 2026-03-13] U_cbox 비동기 로드 대기 로직 추가
-#   원인 확정:
-#     fe.naver.com에서 U_cbox 댓글 시스템이 JS로 비동기 초기화됨
-#     → 페이지 로드 완료(domcontentloaded) 시점에 댓글창이 DOM에 없음
-#     → _find_textarea_in_any_frame()이 모든 frame을 뒤져도 못 찾음
-#   수정:
-#     - _wait_for_comment_area(): 모든 frame을 폴링하며 댓글창 출현 대기
-#       최대 15초 대기, 1초 간격으로 재확인 (비동기 로드 완전 대응)
-#     - submit_comment() 진입 시 _wait_for_comment_area() 먼저 호출
-#     - 스크롤 후 추가 3초 대기 (lazy rendering 완전 대응)
-#   안전장치:
-#     - 15초 후에도 없으면 _find_textarea_in_any_frame()으로 최후 시도
-#     - 전체 frame 디버그 로그 강화
-#
 # [v4.0 — 2026-03-13] fe.naver.com/U_cbox selector 추가 + 전체 frame 탐색
 # [v3.0 — 2026-03-13] iframe 재시도, Ctrl+Enter 폴백
 # [v2.0 — 2026-03-11] frame_locator → page.frames Frame 객체 방식
@@ -31,6 +30,7 @@
 import asyncio
 import random
 import logging
+from typing import Optional, Tuple, Any
 
 from playwright.async_api import Page
 
@@ -61,14 +61,15 @@ AUTHOR_SELECTORS = [
     ".nick",
 ]
 
-# v5.0: 댓글창 출현 감지용 (대기에 사용, 가벼운 selector 우선)
+# v5.0: 댓글창 출현 감지용 (가벼운 컨테이너 selector 우선)
+# v5.1: _wait_for_comment_area()가 (frame, el) 반환 → submit_comment()에서 직접 활용
 COMMENT_AREA_WAIT_SELECTORS = [
-    ".u_cbox_write",
-    "textarea.u_cbox_text",
-    "#cbox_module",
-    ".comment_inbox",
-    ".CommentWriter",
-    "textarea[placeholder*='댓글']",
+    ".u_cbox_write",            # U_cbox 입력 영역 컨테이너
+    "textarea.u_cbox_text",     # U_cbox textarea 직접
+    "#cbox_module",             # U_cbox 전체 모듈
+    ".comment_inbox",           # 구형 시스템
+    ".CommentWriter",           # 구형 시스템
+    "textarea[placeholder*='댓글']",  # 범용 폴백
 ]
 
 # 실제 textarea 탐색용 (더 구체적)
@@ -105,12 +106,15 @@ COMMENT_SUBMIT_SELECTORS = [
 
 
 # ──────────────────────────────────────────
-# Frame 객체 획득
+# Frame 객체 획득 (폴백용 — submit_comment에서는 우선순위 낮음)
 # ──────────────────────────────────────────
 async def _get_cafe_frame(page: Page):
     """
-    게시글 Frame 객체 획득
+    게시글 Frame 객체 획득 (폴백용)
     순서: iframe 대기 → URL 매칭(3회 재시도) → name 매칭 → page 폴백
+
+    v5.1 참고: submit_comment()에서는 _wait_for_comment_area()가 반환한
+              frame을 우선 사용하므로, 이 함수는 보조 폴백 역할만 함
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -147,17 +151,28 @@ async def _get_cafe_frame(page: Page):
 
 
 # ──────────────────────────────────────────
-# v5.0 핵심: 댓글창 출현 대기 (폴링 방식)
+# v5.1 핵심 개선: 댓글창 출현 대기 → (frame, element) 반환
 # ──────────────────────────────────────────
-async def _wait_for_comment_area(page: Page, timeout_sec: float = 15.0) -> bool:
+async def _wait_for_comment_area(
+    page: Page,
+    timeout_sec: float = 15.0,
+) -> Optional[Tuple[Any, Any]]:
     """
-    모든 frame을 폴링하며 댓글 입력창이 나타날 때까지 대기
+    모든 frame을 폴링하며 댓글 입력창 컨테이너가 나타날 때까지 대기
 
-    fe.naver.com에서 U_cbox가 JS로 비동기 초기화되므로
-    domcontentloaded 후에도 바로 탐색하면 못 찾음
-    → 1초 간격 폴링으로 실제 출현 시점 감지
+    [v5.1 변경]
+      반환값: (frame, element) 또는 None
+      기존 bool 반환에서 변경 → submit_comment()가 frame을 직접 재활용
+      가장 큰 변경점: 이 함수가 발견한 frame을 버리지 않음
 
-    Returns: True (발견) / False (타임아웃)
+    [v5.0 설계 의도]
+      fe.naver.com에서 U_cbox가 JS로 비동기 초기화되므로
+      domcontentloaded 후에도 바로 탐색하면 못 찾음
+      → 1초 간격 폴링으로 실제 출현 시점 감지 (최대 15초)
+
+    Returns:
+        (frame, element) — 발견 시
+        None             — 타임아웃 시
     """
     logger.info(f"[dom] 댓글창 출현 대기 시작 (최대 {timeout_sec:.0f}초)...")
     deadline = asyncio.get_event_loop().time() + timeout_sec
@@ -172,13 +187,13 @@ async def _wait_for_comment_area(page: Page, timeout_sec: float = 15.0) -> bool:
                             f"[dom] 댓글창 출현 감지: "
                             f"frame='{frame.url[:50]}' sel='{sel}'"
                         )
-                        return True
+                        return frame, el   # ← v5.1: tuple 반환
                 except Exception:
                     continue
         await asyncio.sleep(1.0)
 
     logger.warning(f"[dom] 댓글창 출현 대기 타임아웃 ({timeout_sec:.0f}초) — 강제 진행")
-    return False
+    return None   # ← v5.1: None 반환 (기존 False 대신)
 
 
 # ──────────────────────────────────────────
@@ -270,36 +285,65 @@ async def read_post_content(page: Page) -> tuple:
 
 
 # ──────────────────────────────────────────
-# 댓글 입력 및 제출 (v5.0: 비동기 로드 대기 추가)
+# 댓글 입력 및 제출 (v5.1: frame 재활용 + frame 내부 스크롤 추가)
 # ──────────────────────────────────────────
 async def submit_comment(page: Page, comment_text: str) -> bool:
     """
     댓글 입력창 탐색 → 텍스트 입력 → 제출
 
-    v5.0 핵심 수정:
-      1. _wait_for_comment_area(): 댓글창 출현까지 폴링 대기 (최대 15초)
-         fe.naver.com U_cbox 비동기 초기화 완전 대응
-      2. 스크롤 후 추가 3초 대기 (lazy rendering 완전 대응)
-      3. 1차 탐색 실패 시 _find_textarea_in_any_frame() 전체 탐색
+    [v5.1 핵심 수정 2가지]
+      수정 1: _wait_for_comment_area()가 반환한 frame 직접 사용
+        기존: 반환값 무시 → _get_cafe_frame() 재호출 → 잘못된 frame 반환 가능
+        수정: 반환된 (frame, el)에서 frame을 직접 재활용
+              → cafe.naver.com 외부 페이지 대신 실제 콘텐츠 frame 보장
+
+      수정 2: 감지된 frame 내부도 스크롤
+        기존: page.evaluate("window.scrollTo...") → 외부 페이지 스크롤만
+        수정: 감지된 frame이 iframe이면 frame 내부에서도 스크롤 실행
+              → 내부 iframe 안의 U_cbox lazy rendering 완전 대응
+
+    [v5.0 유지 사항]
+      - 15초 폴링 대기 (U_cbox 비동기 초기화 대응)
+      - 1차 탐색 실패 시 _find_textarea_in_any_frame() 전체 순회 폴백
+      - type() → fill() → Ctrl+Enter 3단계 제출 폴백
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=15000)
 
-        # ── 1단계: 하단 스크롤 → 댓글창 lazy rendering 유발 ──
+        # ── 1단계: 외부 페이지 스크롤 → 기본 lazy rendering 유발 ──
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2.0)   # 스크롤 후 추가 대기 (v5.0: 1.5→2.0초)
+            await asyncio.sleep(2.0)
         except Exception:
             pass
 
-        # ── 2단계: 댓글창 출현까지 폴링 대기 (v5.0 핵심 추가) ──
-        await _wait_for_comment_area(page, timeout_sec=15.0)
+        # ── 2단계: 댓글창 출현 폴링 대기 (v5.1: frame 정보 반환) ──
+        wait_result = await _wait_for_comment_area(page, timeout_sec=15.0)
 
-        # ── 3단계: cafe frame 안에서 1차 탐색 ──
-        frame    = await _get_cafe_frame(page)
+        # ── 3단계: 감지된 frame 내부도 스크롤 (v5.1 핵심 추가) ──
+        detected_frame = None
+        if wait_result:
+            detected_frame, _ = wait_result
+            # 외부 페이지와 다른 frame(iframe)인 경우에만 내부 스크롤 실행
+            if detected_frame and len(page.frames) > 1:
+                try:
+                    await detected_frame.evaluate(
+                        "window.scrollTo(0, document.body.scrollHeight)"
+                    )
+                    logger.debug(
+                        f"[dom] frame 내부 스크롤 완료: '{detected_frame.url[:50]}'"
+                    )
+                    await asyncio.sleep(1.0)
+                except Exception as scroll_err:
+                    logger.debug(f"[dom] frame 내부 스크롤 불가 (무시): {scroll_err}")
+
+        # ── 4단계: 탐색 대상 frame 결정 (v5.1 핵심: detected_frame 우선 사용) ──
+        # detected_frame이 있으면 그 frame에서 textarea 탐색
+        # 없으면 _get_cafe_frame() 폴백 (타임아웃 시)
+        frame    = detected_frame if detected_frame else await _get_cafe_frame(page)
         input_el = await _find_el(frame, COMMENT_INPUT_SELECTORS, "댓글 입력창")
 
-        # ── 4단계: 전체 frame 순회 2차 탐색 ──
+        # ── 5단계: 전체 frame 순회 2차 탐색 (최후 안전장치) ──
         if input_el is None:
             logger.info("[dom] 1차 탐색 실패 → 전체 frame 순회 탐색")
             frame, input_el = await _find_textarea_in_any_frame(page)
@@ -326,8 +370,8 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
         await asyncio.sleep(random.uniform(0.8, 1.5))
 
         # ── 제출: 버튼 클릭 → Ctrl+Enter 폴백 ──
-        submitted = False
-        submit_el = await _find_el(frame, COMMENT_SUBMIT_SELECTORS, "제출 버튼")
+        submitted  = False
+        submit_el  = await _find_el(frame, COMMENT_SUBMIT_SELECTORS, "제출 버튼")
 
         if submit_el is not None:
             try:
@@ -348,7 +392,7 @@ async def submit_comment(page: Page, comment_text: str) -> bool:
 
         await asyncio.sleep(2.5)
 
-        # ── 성공 검증: 입력창 초기화 여부 ──
+        # ── 성공 검증: 입력창 초기화 여부 확인 ──
         try:
             after_value = await input_el.input_value()
             if after_value == "":

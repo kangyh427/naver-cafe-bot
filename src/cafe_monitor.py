@@ -5,18 +5,26 @@
 #
 # 작성일: 2026-03-09
 # 수정일: 2026-03-13
-# 버전:   v5.1
+# 버전:   v5.2
 #
+# [v5.2 — 2026-03-13] U_cbox 댓글 시스템 완전 지원
+#   개선 1: collect_comments() — U_cbox 댓글 구조 selector 추가
+#           기존: ".comment_list li.CommentItem" 등 구형 selector만 존재
+#           → U_cbox 신규 selector: "li.u_cbox_comment", "ul.u_cbox_list .u_cbox_comment"
+#           → U_cbox 작성자: ".u_cbox_nick", ".u_cbox_nick_area .u_cbox_nick"
+#           → U_cbox 내용: ".u_cbox_contents", ".u_cbox_text_wrap .u_cbox_contents"
+#           → U_cbox 날짜: ".u_cbox_date", "span.u_cbox_date"
+#           효과: fe.naver.com 기반 게시글의 스팸 댓글도 감지/삭제 가능
+#   개선 2: collect_comments() — data-comment-no 속성 추가 (U_cbox ID 방식)
+#           기존: data-comment-id, data-id 만 시도
+#           추가: data-comment-no (U_cbox 고유 식별자)
+#   개선 3: delete_spam_comment() — 클릭 전 hover 추가 (숨겨진 버튼 대응)
+#           기존: 바로 is_visible() → 숨겨진 상태의 delete btn 찾기 실패
+#           추가: 댓글 항목에 hover 후 0.5초 대기 → 버튼 visible 상태로 전환
+#   개선 4: delete_spam_comment() — data-comment-no 기반 selector 추가
+#
+# [v5.1 — 2026-03-13] fe.naver.com frame URL 탐색 추가
 # [v5.0 — 2026-03-13] 삭제 로직 근본 재설계
-#   버그 수정 1: dialog 핸들러를 클릭 후에 등록하던 치명적 오류 수정
-#               → 클릭 전 등록으로 변경 (확인 대화창 놓치던 문제 해결)
-#   버그 수정 2: FrameLocator 방식 → page.frames Frame 객체 방식으로 통일
-#               comment_dom.py와 동일한 Frame 접근 방식 사용
-#   버그 수정 3: 댓글 삭제 시 data-comment-id 기반 selector 우선 사용
-#               → nth-child 방식보다 신뢰성 대폭 향상
-#   개선: 삭제 버튼 selector 다수 추가 (네이버 카페 다양한 DOM 대응)
-#   개선: 재탐색 로직 추가 (삭제 전 해당 게시글 페이지 위치 확인)
-#
 # [v4.0 — 2026-03-12] 댓글 24시간 필터 추가
 # [v3.0 — 2026-03-11] 근본 재설계 (selector 확장, URL 정규화)
 # [v1.0 — 2026-03-09] 최초 작성
@@ -70,7 +78,13 @@ DATE_SELECTORS = [
     "td[class*='date']",
 ]
 
+# v5.2: U_cbox 날짜 selector 추가 (앞에 배치)
 COMMENT_DATE_SELECTORS = [
+    # U_cbox 시스템
+    ".u_cbox_date",
+    "span.u_cbox_date",
+    ".u_cbox_info_main .u_cbox_date",
+    # 구형 시스템
     ".comment_info_date",
     ".comment_date",
     ".date",
@@ -79,11 +93,16 @@ COMMENT_DATE_SELECTORS = [
 ]
 
 # v5.0: 삭제 버튼 selector 목록 (우선순위 순)
+# v5.2: U_cbox delete selector 추가
 DELETE_BTN_SELECTORS = [
+    # U_cbox 시스템 (fe.naver.com)
+    ".u_cbox_btn_delete",
+    ".u_cbox_option .u_cbox_btn_delete",
+    "a.u_cbox_btn_delete",
+    # 구형 시스템 (cafe.naver.com)
     ".btn_delete",
     ".comment_delete",
     ".ico_delete",
-    ".u_cbox_btn_delete",
     "button[class*='delete']",
     "a[class*='delete']",
     ".comment_option .delete",
@@ -334,19 +353,33 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
     """
     comments: list[CommentInfo] = []
 
+    # v5.2: U_cbox selector를 앞에 추가 (fe.naver.com 신규 시스템 우선)
     COMMENT_ITEM_SELECTORS = [
+        # U_cbox 시스템 (fe.naver.com)
+        "ul.u_cbox_list .u_cbox_comment",
+        "li.u_cbox_comment",
+        ".u_cbox_list li",
+        # 구형 시스템 (cafe.naver.com)
         ".comment_list li.CommentItem",
         ".comment-list li",
         ".CommentBox li",
         "li.CommentItem",
     ]
     COMMENT_AUTHOR_SELECTORS = [
+        # U_cbox 시스템
+        ".u_cbox_nick_area .u_cbox_nick",
+        ".u_cbox_nick",
+        # 구형 시스템
         ".comment_nickname .nick",
         ".comment_nickname",
         ".nick",
         ".m-tcol-c",
     ]
     COMMENT_CONTENT_SELECTORS = [
+        # U_cbox 시스템
+        ".u_cbox_text_wrap .u_cbox_contents",
+        ".u_cbox_contents",
+        # 구형 시스템
         ".comment_text_box .comment_text",
         ".comment_text_box",
         ".comment_body",
@@ -379,9 +412,11 @@ async def collect_comments(page: Page, post: PostInfo) -> list[CommentInfo]:
 
         for idx, item in enumerate(comment_items):
             try:
-                # data-comment-id 우선, 없으면 data-id, 최후에 idx_N
+                # v5.2: data-comment-no 추가 (U_cbox 고유 식별자)
+                # 우선순위: data-comment-id → data-comment-no → data-id → idx_N
                 comment_id = (
                     await item.get_attribute("data-comment-id") or
+                    await item.get_attribute("data-comment-no") or
                     await item.get_attribute("data-id") or
                     f"idx_{idx}"
                 )
@@ -474,11 +509,41 @@ async def delete_spam_comment(page: Page, post: PostInfo, comment: CommentInfo) 
 
         frame = await _get_frame_object(page)
 
-        # ── 삭제 버튼 탐색: 전략 1 — data-comment-id ──
+        # ── v5.2: 댓글 항목 hover → 숨겨진 삭제 버튼 활성화 ──
+        # U_cbox에서 삭제 버튼은 기본적으로 hidden 상태
+        # → 댓글 항목에 hover해야 visible 상태로 전환됨
+        comment_item_el = None
+        if comment.comment_id and not comment.comment_id.startswith("idx_"):
+            # U_cbox: data-comment-no 로 아이템 찾기
+            for attr in ["data-comment-no", "data-comment-id", "data-id"]:
+                try:
+                    item_sel = f"[{attr}='{comment.comment_id}']"
+                    el = frame.locator(item_sel).first
+                    if await el.is_visible(timeout=2000):
+                        comment_item_el = el
+                        logger.debug(f"[monitor] 댓글 항목 발견({attr}): hover 준비")
+                        break
+                except Exception:
+                    continue
+
+        if comment_item_el:
+            try:
+                await comment_item_el.hover()
+                await asyncio.sleep(0.5)  # 버튼 visible 전환 대기
+                logger.debug("[monitor] 댓글 항목 hover 완료 — 삭제 버튼 활성화 시도")
+            except Exception as hover_err:
+                logger.debug(f"[monitor] hover 실패 (무시): {hover_err}")
+
+        # ── 삭제 버튼 탐색: 전략 1 — data-comment-id / data-comment-no ──
         delete_btn = None
 
         if comment.comment_id and not comment.comment_id.startswith("idx_"):
             id_selectors = [
+                # v5.2: U_cbox data-comment-no 추가
+                f"[data-comment-no='{comment.comment_id}'] .u_cbox_btn_delete",
+                f"[data-comment-no='{comment.comment_id}'] a[class*='delete']",
+                f"[data-comment-no='{comment.comment_id}'] button[class*='delete']",
+                # 구형 시스템 data-comment-id
                 f"[data-comment-id='{comment.comment_id}'] .btn_delete",
                 f"[data-comment-id='{comment.comment_id}'] .comment_delete",
                 f"[data-id='{comment.comment_id}'] .btn_delete",
@@ -498,10 +563,13 @@ async def delete_spam_comment(page: Page, post: PostInfo, comment: CommentInfo) 
         # ── 삭제 버튼 탐색: 전략 2 — nth-child (item_index 활용) ──
         if delete_btn is None:
             nth = comment.item_index + 1
+            # v5.2: U_cbox 아이템 selector 앞에 추가
             ITEM_PARENT_SELECTORS = [
-                "li.CommentItem",
-                ".comment_list li",
-                ".CommentBox li",
+                "li.u_cbox_comment",       # U_cbox
+                ".u_cbox_list li",         # U_cbox
+                "li.CommentItem",          # 구형
+                ".comment_list li",        # 구형
+                ".CommentBox li",          # 구형
             ]
             for item_sel in ITEM_PARENT_SELECTORS:
                 for del_sel in DELETE_BTN_SELECTORS:
